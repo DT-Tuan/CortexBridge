@@ -19,6 +19,8 @@ After this runbook, the Windows PC has **no** local `claude` state and connects 
 
 ## What gets migrated
 
+> Đây là runbook **một lần** cho trạng thái toàn cục. Để chuyển JSONL + memory của **từng project**, xem [migrate-project-to-vps.md](migrate-project-to-vps.md).
+
 | Item | Path on Windows | Path on VPS | Migrate? |
 |---|---|---|---|
 | User CLAUDE.md | `C:\Users\Tuan\.claude\CLAUDE.md` | `~/.claude/CLAUDE.md` | ✅ Yes |
