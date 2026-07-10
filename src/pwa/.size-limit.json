@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Initial JS (entry chunks)",
+    "path": "build/_app/immutable/entry/*.js",
+    "limit": "50 KB",
+    "gzip": true
+  },
+  {
+    "name": "Initial CSS",
+    "path": "build/_app/immutable/assets/*.css",
+    "limit": "20 KB",
+    "gzip": true
+  }
+]

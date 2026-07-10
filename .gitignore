@@ -1,0 +1,64 @@
+# --- Secrets / env ---
+.env
+.env.local
+.env.*.local
+*.pfx
+*.pem
+*.key
+
+# --- .NET ---
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+.dotnet/
+
+# --- Node / SvelteKit ---
+node_modules/
+.svelte-kit/
+build/
+dist/
+.vite/
+.turbo/
+*.tsbuildinfo
+.npm
+.pnpm-store/
+
+# --- IDE / OS ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Docker / runtime ---
+docker/data/
+*.sqlite
+*.sqlite-journal
+*.db-shm
+*.db-wal
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Claude Code (local-only settings; CLAUDE.md and skills MUST be committed) ---
+.claude/settings.local.json
+# personal permission allowlist — may embed tokens; never commit
+.claude/settings.json
+.claude/projects/
+
+# Bundle analyzer outputs
+stats.html
+bundle-stats/
+
+# MSBuild/Roslyn design-time cache (never commit)
+*.lscache

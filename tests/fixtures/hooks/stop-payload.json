@@ -1,0 +1,7 @@
+{
+  "session_id": "01999999-aaaa-bbbb-cccc-dddddddddddd",
+  "transcript_path": "/home/cortex/.claude/projects/-workspace-sample-project/01999999-aaaa-bbbb-cccc-dddddddddddd.jsonl",
+  "cwd": "/workspace/sample-project",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false
+}

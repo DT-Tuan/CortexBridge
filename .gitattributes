@@ -1,0 +1,30 @@
+# Default: text auto-detect, normalize to LF on commit
+* text=auto eol=lf
+
+# Shell + Linux config files MUST be LF
+*.sh        text eol=lf
+*.bash      text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+Caddyfile*  text eol=lf
+
+# Windows scripts stay CRLF
+*.ps1       text eol=crlf
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+
+# Binary blobs
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.tar       binary
+*.gz        binary
+*.zst       binary
+*.dll       binary
+*.exe       binary
+*.pfx       binary

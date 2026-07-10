@@ -1,0 +1,48 @@
+# Build artifacts
+**/bin/
+**/obj/
+**/node_modules/
+**/.svelte-kit/
+**/build/
+**/dist/
+
+# IDE
+.vscode/
+.idea/
+.vs/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Tests + coverage
+**/TestResults/
+**/coverage/
+
+# Docs (not needed in image)
+docs/
+README.md
+*.md
+!CLAUDE.md
+
+# Local env
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local
+.claude/settings.local.json
+.claude/settings.json
+.claude/projects/
+
+# Logs
+*.log
+logs/
+
+# Bundle stats
+stats.html
+bundle-stats/

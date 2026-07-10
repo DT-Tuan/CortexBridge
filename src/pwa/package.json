@@ -1,0 +1,48 @@
+{
+	"name": "cortexbridge-pwa",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"packageManager": "pnpm@9.15.4",
+	"scripts": {
+		"dev": "vite dev --host 0.0.0.0 --port 5173",
+		"build": "vite build",
+		"preview": "vite preview --port 5173",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"size": "size-limit",
+		"size:why": "size-limit --why",
+		"ci": "pnpm check && pnpm test && pnpm build && pnpm size"
+	},
+	"devDependencies": {
+		"@size-limit/file": "^11.1.0",
+		"@sveltejs/adapter-static": "^3.0.8",
+		"@sveltejs/kit": "^2.57.0",
+		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"@tailwindcss/vite": "^4.1.0",
+		"@testing-library/svelte": "^5.2.0",
+		"@vitest/ui": "^3.0.0",
+		"jsdom": "^26.0.0",
+		"size-limit": "^11.1.0",
+		"svelte": "^5.55.2",
+		"svelte-check": "^4.4.6",
+		"tailwindcss": "^4.1.0",
+		"typescript": "^6.0.2",
+		"vite": "^8.0.7",
+		"vite-plugin-pwa": "^1.0.0",
+		"vitest": "^3.0.0"
+	},
+	"dependencies": {
+		"highlight.js": "^11",
+		"marked": "^18.0.3",
+		"workbox-precaching": "^7.3.0"
+	},
+	"pnpm": {
+		"onlyBuiltDependencies": [
+			"esbuild"
+		]
+	}
+}

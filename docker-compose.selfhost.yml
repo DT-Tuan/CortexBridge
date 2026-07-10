@@ -1,0 +1,90 @@
+# CortexBridge — minimal self-host stack.
+#
+# One service: the bridge itself. No Caddy, no Cloudflare Tunnel — you reach it
+# over LAN or a VPN (Netbird / Tailscale / WireGuard). This is the file to use if
+# you are NOT reproducing the author's Proxmox + Netbird + CF Tunnel setup.
+#
+#   docker compose -f docker-compose.selfhost.yml up -d --build
+#
+# Every host path is parameterised, so nothing here assumes the author's home
+# directory. Copy .env.selfhost.example → .env and fill it in first.
+#
+# See docs/runbooks/selfhost-quickstart.md.
+#
+# SECURITY: BRIDGE_BIND_IP defaults to loopback on purpose. The bridge can run
+# arbitrary commands through tmux — it is effectively your shell. Only ever bind
+# it to a LAN or VPN interface, never to a public IP.
+
+name: cortexbridge
+
+services:
+  cc-bridge:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: cortexbridge/cc-bridge:latest
+    container_name: cc-bridge
+    restart: unless-stopped
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:3000
+      - BRIDGE_ADMIN_SECRET=${BRIDGE_ADMIN_SECRET:?set this in .env — openssl rand -hex 32}
+      # Origin the PWA is served from. Hooks build push click-through URLs from it.
+      # For iOS Web Push this MUST be an https origin with a publicly-trusted cert.
+      - BRIDGE_PUBLIC_URL=${BRIDGE_PUBLIC_URL:?set this in .env}
+      # Web Push (VAPID). Generate once: npx --yes web-push generate-vapid-keys
+      - VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY:?set this in .env}
+      - VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY:?set this in .env}
+      - VAPID_SUBJECT=${VAPID_SUBJECT:-mailto:noreply@cortexbridge.local}
+      # Optional: CortexPlexus MCP memory cockpit. Leave unset unless you run one.
+      - CortexPlexus__McpUrl=${CORTEXPLEXUS_MCP_URL:-}
+    volumes:
+      # Your projects. The bridge only ever sees projects that live under here.
+      - ${CORTEX_WORKSPACE:?set this in .env}:/workspace
+      # Claude Code's config + credentials + JSONL transcripts. Bind-mounted, never baked in.
+      - ${CORTEX_CLAUDE_DIR:?set this in .env}:/home/cortex/.claude
+      # The tmux SERVER runs on the host (ADR-013); this container holds only a
+      # tmux CLIENT. Your host uid must be 1000 to match the container's `cortex`
+      # user, otherwise the socket is unreadable. Check with: id -u
+      - /tmp/tmux-${CORTEX_UID:-1000}:/tmp/tmux-1000
+      # Bridge's own state: audit log, bearer tokens, push subscriptions.
+      - ${CORTEX_DATA_DIR:?set this in .env}:/data
+    networks:
+      - cortex
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    ports:
+      # Loopback by default. Claude Code hooks running on the host POST to this.
+      # To reach the PWA from a phone on your LAN, set BRIDGE_BIND_IP to the
+      # host's LAN or VPN address (e.g. 192.168.1.50). Never 0.0.0.0 on a box
+      # with a public interface.
+      - "${BRIDGE_BIND_IP:-127.0.0.1}:3000:3000"
+
+  # Optional: publicly-trusted TLS without opening a firewall port.
+  # iOS refuses to register Web Push on a self-signed / private-CA origin
+  # (ADR-012), so if you want notifications on an iPhone you need this (or any
+  # other reverse proxy holding a real cert).
+  #
+  #   docker compose -f docker-compose.selfhost.yml --profile tunnel up -d
+  #
+  # Route the tunnel's Public Hostname → http://cc-bridge:3000 in the
+  # Cloudflare Zero Trust dashboard, and set BRIDGE_PUBLIC_URL to match.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      - cortex
+    depends_on:
+      cc-bridge:
+        condition: service_healthy
+
+networks:
+  cortex:
+    driver: bridge

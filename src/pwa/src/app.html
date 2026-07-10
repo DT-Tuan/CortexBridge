@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="vi">
+	<head>
+		<meta charset="utf-8" />
+		<!-- interactive-widget=resizes-content (iOS 16.4+, Android Chrome): keyboard
+		     shrinks the layout viewport, so `position: fixed; bottom: 0` composer
+		     naturally sits on top of the keyboard with no JS needed. Safe to include
+		     for older browsers (just ignored). -->
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<meta name="theme-color" content="#0f172a" />
+		<link rel="apple-touch-icon" href="/icon-180.png" />
+		<link rel="manifest" href="/manifest.webmanifest" />
+		<title>CortexBridge</title>
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="tap">
+		<!-- App root must be a real flex container so chat view's scroll area gets
+		     a finite height. display:contents would skip layout and break flex-1. -->
+		<div id="app-root" style="display: flex; flex-direction: column; flex: 1; min-height: 0;">
+			%sveltekit.body%
+		</div>
+	</body>
+</html>

@@ -1,0 +1,53 @@
+# CortexBridge — Caddy reverse proxy for the Netbird ingress path.
+# Mobile (public) ingress goes through Cloudflare Tunnel instead — see
+# docker-compose.yml `cloudflared` service.
+#
+# Set $BRIDGE_HOSTNAME via environment. Port binding to the Netbird IP is
+# enforced in docker-compose.yml (Caddy itself binds 0.0.0.0 inside the container).
+
+{
+	# Disable the admin API in prod (we manage via reload)
+	admin off
+	# Use Caddy's local CA (no public ACME — domain is private/.netbird).
+	# Used only by Netbird-side clients; mobile uses CF public cert (ADR-012).
+	local_certs
+}
+
+# Bridge (PWA + API)
+{$BRIDGE_HOSTNAME} {
+	tls internal
+	encode zstd gzip
+
+	# API + SSE — must NOT proxy /internal/* (loopback-only by design)
+	@api path /api/*
+	handle @api {
+		reverse_proxy cc-bridge:3000 {
+			# SSE: disable buffering
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	# Block any external attempt to reach /internal/* (defense-in-depth;
+	# bridge also rejects non-loopback at the middleware layer).
+	@internal path /internal/*
+	handle @internal {
+		respond "not found" 404
+	}
+
+	# PWA static + SPA fallback (served by ASP.NET wwwroot)
+	handle {
+		reverse_proxy cc-bridge:3000
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}
+

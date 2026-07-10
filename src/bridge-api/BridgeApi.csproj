@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CortexBridge.Api</RootNamespace>
+    <AssemblyName>bridge-api</AssemblyName>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.0" />
+    <!-- Override the native SQLite lib that EF Core pulls transitively (2.1.11):
+         it carries GHSA-2m69-gcr7-jv3q (high), which NuGetAudit + TreatWarningsAsErrors
+         turn into a restore-time build failure. 3.50.3 is the patched native build
+         (package re-versioned to track the SQLite version); C ABI is unchanged, so it
+         drops in under the unchanged SQLitePCLRaw core/provider. -->
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.50.3" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <PackageReference Include="WebPush" Version="1.0.13" />
+  </ItemGroup>
+
+</Project>

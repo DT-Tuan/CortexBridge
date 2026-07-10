@@ -1,0 +1,73 @@
+# Phase 3.C — ADR-021. Three parallel jobs gate every PR + every push to main.
+# No GHCR push in v1 (deferred — single-user / single-host deploys live by
+# `git pull && docker compose build`; revisit on a release-tag trigger when a
+# reproducible-deploy need actually arises).
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel a previous run on the same ref when a new push lands — no wasted
+# minutes on amended PRs / rapid fixups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (xUnit 118+)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          # .NET 10 preview supported by setup-dotnet@v4 via the x range.
+          dotnet-version: '10.0.x'
+      - name: Restore + test (TreatWarningsAsErrors enforced by csproj)
+        run: dotnet test tests/BridgeApi.Tests/BridgeApi.Tests.csproj --nologo
+
+  pwa:
+    name: PWA (typecheck + vitest + build + size)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/pwa
+    steps:
+      - uses: actions/checkout@v5
+      # pnpm/action-setup reads the pinned version from a package.json's
+      # `packageManager` field (canonical source per ADR-021 §7). It runs at
+      # the repo ROOT (action steps ignore `defaults.run.working-directory`)
+      # and the repo has no root package.json — so point it explicitly at the
+      # PWA's. Without this it fails: "No pnpm version is specified".
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: src/pwa/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.x'
+          cache: 'pnpm'
+          cache-dependency-path: src/pwa/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm size
+
+  docker:
+    name: Docker build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v4
+      # Build the Dockerfile directly, NOT `docker compose build`. The compose
+      # service declares required runtime env (BRIDGE_ADMIN_SECRET, VAPID_*,
+      # BRIDGE_PUBLIC_URL via `${VAR:?required}`) which compose interpolates at
+      # parse time — CI has no .env (gitignored), so `docker compose build`
+      # errored before building. The build itself needs none of those (they're
+      # runtime ENV, not build ARGs); `docker build` verifies the multi-stage
+      # Dockerfile cleanly. Context `.` matches the compose `context: .`.
+      - name: Build cc-bridge image (verify multi-stage Dockerfile)
+        run: docker build -f docker/Dockerfile -t cc-bridge:ci .

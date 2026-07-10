@@ -1,0 +1,46 @@
+# CortexBridge — LOCAL Docker Desktop test
+# Caddy with local CA, listens on PC LAN IP for iPhone access via wifi/VPN.
+# {$BRIDGE_HOSTNAME} = e.g. 192.168.1.50
+
+{
+	admin off
+	local_certs
+	# auto_https off would skip TLS; we keep it on so iPhone can install PWA (requires HTTPS)
+}
+
+# PWA + API on standard 443
+https://{$BRIDGE_HOSTNAME} {
+	bind 0.0.0.0
+	tls internal
+	encode zstd gzip
+
+	@api path /api/*
+	handle @api {
+		reverse_proxy cc-bridge:3000 {
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	# /internal/* MUST NOT be reachable externally (loopback enforcement is also in middleware)
+	@internal path /internal/*
+	handle @internal {
+		respond "not found" 404
+	}
+
+	# PWA static + SPA fallback (served by ASP.NET wwwroot)
+	handle {
+		reverse_proxy cc-bridge:3000
+	}
+}
+
+# ntfy on :8443 (separate port = simpler than path-prefixing)
+# iOS ntfy app: subscribe to https://{HOSTNAME}:8443/{TOPIC}
+https://{$BRIDGE_HOSTNAME}:8443 {
+	bind 0.0.0.0
+	tls internal
+	reverse_proxy ntfy:80
+}

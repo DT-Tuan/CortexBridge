@@ -1,0 +1,70 @@
+{
+  "$comment": "CortexBridge hook wiring for Claude Code. Merge into ~/.claude/settings.json ON THE HOST — claude runs on the host per ADR-013, not in the container. Replace __HOME__ first: sed -i \"s|__HOME__|$HOME|g\". See docs/runbooks/selfhost-quickstart.md.",
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-notify-hook.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-stop-hook.sh" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-activity-hook.sh UserPromptSubmit" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-activity-hook.sh PreToolUse" },
+          { "type": "command", "command": "__HOME__/.local/bin/cc-autoallow-hook.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-activity-hook.sh PostToolUse" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-activity-hook.sh SessionStart" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-activity-hook.sh SessionEnd" }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.local/bin/cc-activity-hook.sh SubagentStop" }
+        ]
+      }
+    ]
+  }
+}
