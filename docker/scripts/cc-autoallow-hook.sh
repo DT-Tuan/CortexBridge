@@ -62,7 +62,12 @@ TOOL="$(jq -r '.tool_name // empty' <<<"$PAYLOAD" 2>/dev/null)"
 # --- allowlists ---------------------------------------------------------------
 # Read-only simple programs (matched by basename). `find` is EXCLUDED (-exec/-delete);
 # `sort` is EXCLUDED (-o/--output writes). git/env are handled specially below.
-SIMPLE_SAFE=" ls cat pwd head tail wc echo file stat du df tree which whoami date \
+# `cd` is safe: it only moves the subshell's cwd (no write/network/delete). Its
+# ONLY dangerous forms — `cd $(...)`, `cd `...``, `cd >f`, `cd x; rm` — are already
+# rejected outright by the substitution/redirect/backgrounding guard and the
+# per-segment split. Without it here, CC's ubiquitous `cd <project> && <read-only>`
+# compound falls through to a manual permission prompt on every diagnostic command.
+SIMPLE_SAFE=" ls cat pwd cd head tail wc echo file stat du df tree which whoami date \
 grep rg fd jq cut uniq comm nl tac tr basename dirname realpath readlink column \
 printenv sha256sum sha1sum md5sum cksum "
 # git read-only subcommands (config handled separately — it can also write).

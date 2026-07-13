@@ -92,6 +92,15 @@ expect allow "pipe RO"       Bash "$(bash_in 'cat README.md | grep foo | head -5
 expect allow "; chain RO"    Bash "$(bash_in 'ls -la; pwd; cat README.md')"
 expect allow "|| chain RO"   Bash "$(bash_in 'git rev-parse HEAD || git status')"
 
+echo "-- cd is read-only (CC prefixes diagnostics with 'cd <proj> && ...') --"
+expect allow "cd alone"        Bash "$(bash_in 'cd /home/u/workspace/proj')"
+expect allow "cd && cat"       Bash "$(bash_in 'cd /home/u/workspace/proj && cat src/x.cs')"
+expect allow "cd && echo && grep" Bash "$(bash_in 'cd /w/proj && echo hi && grep -n foo y.cs')"
+# dangerous cd forms must STILL prompt (guards independent of SIMPLE_SAFE)
+expect prompt "cd \$(subst)"   Bash "$(bash_in 'cd $(cat /etc/x)')"
+expect prompt "cd; rm"         Bash "$(bash_in 'cd /tmp && rm -rf /tmp/y')"
+expect prompt "cd redirect"    Bash "$(bash_in 'cd /tmp > /tmp/out')"
+
 echo "-- compound with ANY unsafe segment still prompts --"
 expect prompt "RO && build (auton off)" Bash "$(bash_in 'cat x && npm run build')"
 expect prompt "pipe to tee (write)"     Bash "$(bash_in 'ls | tee out.txt')"

@@ -7,6 +7,7 @@
 	import type { CortexUsage } from '$lib/api/sessions';
 	import { ApiException } from '$lib/api/client';
 	import { StreamConnection } from '$lib/api/sse';
+	import { shouldReArmNeedsInput } from '$lib/utils/needs-input';
 	import type { SessionMessage } from '$lib/api/types';
 	import ChatBubble from '$lib/components/ChatBubble.svelte';
 	import OwnerBanner from '$lib/components/OwnerBanner.svelte';
@@ -125,6 +126,35 @@
 		hasEarlier = !!t.truncated;
 		totalMessages = t.total ?? 0;
 		refreshCortex();
+	}
+
+	// needsInput is otherwise set ONLY by an SSE status transition (onStatus) or a
+	// local optimistic action — never from REST. iOS suspends the EventSource in the
+	// background, so a permission / AskUserQuestion prompt that appears while
+	// backgrounded is delivered by that single transition frame, which the
+	// suspend→foreground reconnect can drop (wake() may judge a keepalive-fed
+	// connection "healthy" and skip the reconnect that would resend the initial
+	// snapshot). The banner+panel then never render even though the server holds
+	// needsInput=true. reloadView() resyncs history but not this signal. Re-arm it
+	// from the authoritative REST status on foreground — ADDITIVELY: only ever set
+	// true, never clear here (clearing stays with SSE/optimistic so we can't race a
+	// just-sent reply). Setting it true re-fires the $effect that fetches /prompt.
+	async function reconcileNeedsInputFromRest() {
+		if (needsInput || Date.now() - lastReplyAt < STALE_NOTIFY_GUARD_MS) return;
+		const mine = (await sessionsApi.list()).find((s) => s.projectId === projectId);
+		if (!mine) return;
+		// Re-evaluate the guards AFTER the await — a reply or SSE frame may have
+		// landed meanwhile. shouldReArmNeedsInput centralises the additive-only rule.
+		if (
+			shouldReArmNeedsInput({
+				current: needsInput,
+				restNeedsInput: mine.needsInput,
+				msSinceReply: Date.now() - lastReplyAt,
+				guardMs: STALE_NOTIFY_GUARD_MS
+			})
+		) {
+			needsInput = true;
+		}
 	}
 	let needsInput = $state(false);
 	let notificationMessage = $state<string | null>(null);
@@ -872,6 +902,8 @@
 			if (!auth.isAuthed || readOnly) return;
 			stream?.wake();
 			reloadView().catch(() => {});
+			// Recover a needsInput prompt whose SSE frame was lost across the suspend.
+			reconcileNeedsInputFromRest().catch(() => {});
 		};
 		document.addEventListener('visibilitychange', onForeground);
 		window.addEventListener('pageshow', onForeground);

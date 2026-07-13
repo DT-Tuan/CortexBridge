@@ -124,7 +124,7 @@ python3 scripts/migrate/rewrite-paths.py \
 
 **Trước khi soạn `--map`, hãy xem chuỗi `cwd` thật trong JSONL** (`grep -o '"cwd":"[^"]*"' <file>.jsonl | head`). Tên thư mục trên PC **không** đảm bảo bằng đường dẫn trong record — hai cái bẫy hay gặp:
 - Sai hoa/thường (thư mục `Foo` nhưng record ghi `foo`).
-- Thư mục dùng gạch nối nhưng đường dẫn thật dùng dấu cách (`Time-Attendance-System` ↔ `Time Attendance System`).
+- Thư mục dùng gạch nối nhưng đường dẫn thật dùng dấu cách (`My-Cool-App` ↔ `My Cool App`).
 
 Truyền mọi biến thể prefix mà JSONL có thể dùng (ổ đĩa hoa + thường, cộng đường dẫn `~/.claude/projects/<encoded>` phía PC cho các tham chiếu memory-dir).
 

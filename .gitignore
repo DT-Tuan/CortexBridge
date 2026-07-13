@@ -63,6 +63,6 @@ bundle-stats/
 # MSBuild/Roslyn design-time cache (never commit)
 *.lscache
 
-# Python
+# Python (tooling under tools/)
 __pycache__/
 *.pyc
