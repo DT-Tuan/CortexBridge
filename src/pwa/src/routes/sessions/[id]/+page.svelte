@@ -125,6 +125,7 @@
 		loadFresh(t.messages);
 		hasEarlier = !!t.truncated;
 		totalMessages = t.total ?? 0;
+		shownSessionUuid = t.sessionUuid; // keep the session-switch baseline current
 		refreshCortex();
 	}
 
@@ -139,12 +140,50 @@
 	// from the authoritative REST status on foreground — ADDITIVELY: only ever set
 	// true, never clear here (clearing stays with SSE/optimistic so we can't race a
 	// just-sent reply). Setting it true re-fires the $effect that fetches /prompt.
-	async function reconcileNeedsInputFromRest() {
-		if (needsInput || Date.now() - lastReplyAt < STALE_NOTIFY_GUARD_MS) return;
+	// The session UUID currently displayed. Lets the REST reconcile below detect a
+	// live session switch (e.g. /clear starts a NEW session UUID) that the SSE
+	// session_switch frame missed. Set wherever we (re)load a session's transcript.
+	let shownSessionUuid = $state<string | null>(null);
+
+	// Follow the project's LIVE session — same effect as the SSE onSessionSwitch
+	// handler: drop any stale ?session= pin and reload the transcript onto the new
+	// live slot. Called from onSessionSwitch (fast path) AND the REST reconcile
+	// (self-healing net when that frame was dropped).
+	async function followLiveSession() {
+		if (requestedSessionUuid) {
+			const u = new URL(page.url);
+			u.searchParams.delete('session');
+			replaceState(u, {});
+		}
+		fullLoaded = false; // new session opens on the tail
+		const t2 = await sessionsApi.transcript(projectId, undefined, INITIAL_LIMIT);
+		loadFresh(t2.messages);
+		hasEarlier = !!t2.truncated;
+		totalMessages = t2.total ?? 0;
+		shownSessionUuid = t2.sessionUuid;
+		scrollToBottomNow();
+	}
+
+	// Self-healing REST reconcile: one list read covers TWO signals whose only live
+	// delivery is an SSE frame that an iOS suspend / dropped connection can eat —
+	//  (1) a live session switch (/clear → new UUID): if we're following live (no
+	//      explicit pin) and the active session no longer matches what we show,
+	//      follow it — otherwise the chat sits on the dead old transcript until the
+	//      user backs out to the dashboard and re-enters;
+	//  (2) needsInput whose status transition was dropped (additive re-arm, guarded
+	//      against racing a just-sent reply).
+	async function reconcileFromRest() {
 		const mine = (await sessionsApi.list()).find((s) => s.projectId === projectId);
 		if (!mine) return;
-		// Re-evaluate the guards AFTER the await — a reply or SSE frame may have
-		// landed meanwhile. shouldReArmNeedsInput centralises the additive-only rule.
+		if (
+			!requestedSessionUuid &&
+			mine.sessionUuid &&
+			shownSessionUuid &&
+			mine.sessionUuid !== shownSessionUuid
+		) {
+			await followLiveSession(); // reloads everything; needsInput re-derives next tick
+			return;
+		}
 		if (
 			shouldReArmNeedsInput({
 				current: needsInput,
@@ -487,6 +526,7 @@
 			// Anchor the SSE handshake to exactly what this read consumed.
 			streamSince = t.tailOffset ?? 0;
 			streamSinceSession = t.sessionUuid;
+			shownSessionUuid = t.sessionUuid; // baseline for the session-switch reconcile
 			scrollToBottomNow();
 		} catch (e) {
 			if (e instanceof ApiException && e.status === 401) {
@@ -555,20 +595,11 @@
 				},
 				onSessionSwitch: () => {
 					// issue #1: CC switched sessions (e.g. /clear) in the same tmux
-					// window. Drop any ?session=<oldUuid> pin so reply / interrupt /
-					// needsInput follow the new live slot instead of the dead session.
-					if (requestedSessionUuid) {
-						const u = new URL(page.url);
-						u.searchParams.delete('session');
-						replaceState(u, {});
-					}
-					fullLoaded = false;   // new session opens on the tail
-					sessionsApi.transcript(projectId, undefined, INITIAL_LIMIT).then((t2) => {
-						loadFresh(t2.messages);   // clears + repopulates in one batch
-						hasEarlier = !!t2.truncated;
-						totalMessages = t2.total ?? 0;
-						scrollToBottomNow();
-					});
+					// window. Follow the new live slot (drops any ?session=<oldUuid>
+					// pin) so reply / interrupt / needsInput target it, not the dead
+					// session. Same action the REST reconcile takes when this frame
+					// is dropped.
+					followLiveSession();
 				},
 				onSessionReset: () => {
 					seenUuids.clear();
@@ -644,6 +675,12 @@
 			);
 			lastReplyAt = Date.now();
 			dismissDeviceNotification();
+			// The reply may have been /clear, which starts a NEW session UUID. The SSE
+			// session_switch is the fast path; nudge the REST reconcile too (after the
+			// new session has had a moment to materialise) so we follow it within
+			// seconds even if that frame was dropped, instead of on the 15s poll.
+			setTimeout(() => reconcileFromRest().catch(() => {}), 3000);
+			setTimeout(() => reconcileFromRest().catch(() => {}), 8000);
 		} catch (e) {
 			// Roll back the optimistic message on failure, restore composer text for retry
 			const idx = messages.findIndex((x) => x.uuid === tempUuid);
@@ -903,7 +940,7 @@
 			stream?.wake();
 			reloadView().catch(() => {});
 			// Recover a needsInput prompt whose SSE frame was lost across the suspend.
-			reconcileNeedsInputFromRest().catch(() => {});
+			reconcileFromRest().catch(() => {});
 		};
 		document.addEventListener('visibilitychange', onForeground);
 		window.addEventListener('pageshow', onForeground);
@@ -913,6 +950,32 @@
 			window.removeEventListener('pageshow', onForeground);
 			window.removeEventListener('online', onForeground);
 		};
+	});
+
+	// needsInput recovery on navigation + a slow self-correcting poll. The SSE
+	// status transition is the primary signal, but three real cases miss it and
+	// the foreground handler above does NOT cover them: (1) the transition frame
+	// is dropped across an iOS suspend; (2) CC does NOT re-fire the Notification
+	// hook for a STILL-PENDING prompt, so a single dropped frame is never resent;
+	// (3) in-app navigation between projects (same route, different param) doesn't
+	// fire visibilitychange. A live git-push permission prompt sat with the server
+	// holding needsInput=true while the panel never rendered because of exactly
+	// this. Re-read the authoritative REST status once when the project changes,
+	// then on a slow timer while the session is idle-but-running (the only state
+	// where an un-surfaced prompt can exist). The same class of miss also strands a
+	// live session switch (/clear) on the dead old transcript; reconcileFromRest is
+	// additive + self-guarding, so this can only ever surface a real prompt.
+	$effect(() => {
+		void projectId; // re-arm the initial reconcile when navigating to another session
+		if (!auth.isAuthed || readOnly) return;
+		reconcileFromRest().catch(() => {});
+		const id = setInterval(() => {
+			if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+			// Skip the fetch when a prompt is already shown or CC is clearly busy.
+			if (needsInput || sending || serverProcessing) return;
+			reconcileFromRest().catch(() => {});
+		}, 15_000);
+		return () => clearInterval(id);
 	});
 
 	const askUserQuestion = $derived.by<{ questions: AskQuestion[] } | null>(() => {
