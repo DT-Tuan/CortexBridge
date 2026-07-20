@@ -59,7 +59,13 @@ public static class InternalHooksEndpoints
             // Tool name + match reason only — never the command itself (may hold secrets).
             Detail = $"{payload.Tool}: {payload.Reason}",
         });
-        await db.SaveChangesAsync(ct);
+        // Accepted-work token, not the request token: the auto-allow hook gives
+        // curl 2 s and backgrounds it, so binding the audit write to the caller
+        // meant an audit row could be dropped with no trace whenever SQLite was
+        // briefly contended. An audit trail that silently loses entries under
+        // load is worse than useless — it reads as "this never happened".
+        using var work = AcceptedWork();
+        await db.SaveChangesAsync(work.Token);
 
         return Results.Json(new { acceptedAt = DateTimeOffset.UtcNow.ToString("o") },
             Json.Default, statusCode: 202);
@@ -126,9 +132,10 @@ public static class InternalHooksEndpoints
         if (string.Equals(payload.Kind, "SessionStart", StringComparison.OrdinalIgnoreCase)
             && !string.IsNullOrEmpty(payload.SessionId))
         {
+            using var work = AcceptedWork();
             await MaybeRepointLiveSlotAsync(
                 payload.ProjectId, payload.SessionId,
-                scanner, ownership, tmux, db, log, ct);
+                scanner, ownership, tmux, db, log, work.Token);
         }
 
         return Results.Json(new { acceptedAt = DateTimeOffset.UtcNow.ToString("o") },
@@ -265,7 +272,11 @@ public static class InternalHooksEndpoints
         //      has no JSONL here. scanner.ResolveAsync returns null → skip
         //      both needsInput latch + Web Push fan-out (would otherwise fan
         //      to all devices as "<pc-project> needs input", the stray push).
-        var vmSession = await scanner.ResolveAsync(payload.ProjectId, ct);
+        // Everything from here on is accepted work — the session resolve gates
+        // BOTH the needsInput latch and the push, so losing it to the caller's
+        // 5 s curl budget drops the whole notification, not just the push.
+        using var work = AcceptedWork();
+        var vmSession = await scanner.ResolveAsync(payload.ProjectId, work.Token);
         if (vmSession is null)
         {
             log.LogInformation(
@@ -324,7 +335,7 @@ public static class InternalHooksEndpoints
                 title: $"{payload.ProjectId} needs input",
                 body: msgText,
                 clickUrl: clickUrl,
-                ct);
+                work.Token);
         }
         catch (Exception ex)
         {
@@ -371,13 +382,55 @@ public static class InternalHooksEndpoints
         // so any device with a lingering lockscreen notification dismisses it. Best-effort.
         if (wasWaiting)
         {
-            try { await webPush.SendClearAsync(db, payload.ProjectId, ct); }
+            try
+            {
+                using var work = AcceptedWork();
+                await webPush.SendClearAsync(db, payload.ProjectId, work.Token);
+            }
             catch (Exception ex) { log.LogDebug(ex, "Clear push failed for {Project}", payload.ProjectId); }
         }
 
         return Results.Json(new { acceptedAt = DateTimeOffset.UtcNow.ToString("o") },
             Json.Default, statusCode: 202);
     }
+
+    /// <summary>
+    /// How long ACCEPTED work may run once the 202 contract is entered. Generous
+    /// on purpose: a Web Push fan-out makes outbound TLS calls to Apple/Mozilla/
+    /// Google push services, and a live-slot re-point does a tmux round trip plus
+    /// a SQLite write under contention.
+    /// </summary>
+    private static readonly TimeSpan AcceptedWorkTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// A cancellation source for work these endpoints have ACCEPTED — deliberately
+    /// NOT the request token.
+    ///
+    /// <para>A Minimal API <c>CancellationToken</c> parameter binds to
+    /// <c>HttpContext.RequestAborted</c>, so it fires the moment the CALLER walks
+    /// away. Every hook script here is fire-and-forget with a short curl budget
+    /// (<c>--max-time 2</c> for activity, <c>5</c> for notification/stop) and
+    /// discards the response entirely. Binding accepted work to that token meant
+    /// curl's patience — not the work's own deadline — decided whether a Web Push
+    /// fan-out or a live-slot re-point completed.</para>
+    ///
+    /// <para>Live evidence 2026-07-20: <c>Web Push fanout failed</c> and
+    /// <c>Live-slot re-point failed</c>, both
+    /// <c>TaskCanceledException at RelationalConnection.OpenInternalAsync</c> —
+    /// the DB open cancelled mid-flight. The re-point case is the worse of the
+    /// two: dropping it silently defeats the post-/clear session resolution the
+    /// Tier-0 work exists to provide, and it only has a 2 s budget.</para>
+    ///
+    /// <para>Returning 202 means "accepted, it will happen". Honour that: once we
+    /// commit to the work, it runs to its own deadline regardless of whether
+    /// anyone is still listening. The trade-off is that the request outlives the
+    /// client's timeout — harmless here, since every caller already ignores the
+    /// response body and backgrounds the call.</para>
+    ///
+    /// <para>Request-bound work — reading the request body — keeps the request
+    /// token, which is correct: there is nothing to read once the caller is gone.</para>
+    /// </summary>
+    private static CancellationTokenSource AcceptedWork() => new(AcceptedWorkTimeout);
 
     private static bool ValidateHookAuth(HttpContext ctx, HookTokenProvider tokens)
     {
