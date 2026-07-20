@@ -138,9 +138,14 @@ public static class InternalHooksEndpoints
     /// <summary>
     /// Re-points the per-project live-slot marker (session_ownership.session_uuid)
     /// to <paramref name="newSessionId"/> when CC has switched sessions on its own
-    /// (e.g. /clear). Guarded so a PC-side CC's hooks can't hijack the marker, and
-    /// so we only act once the new session's JSONL actually exists on this host.
-    /// A no-op for untracked projects — those already follow newest-by-last-record.
+    /// (e.g. /clear). Guarded so a PC-side CC's hooks can't hijack the marker.
+    ///
+    /// The SessionStart hook is the ONLY signal that identifies the new session at
+    /// the moment it is created: CC fires it with the new session_id but does not
+    /// write the session's JSONL until the first prompt (measured: 3m20s apart —
+    /// hook 05:04:27, file born 05:07:47). Anything that waits for the file to
+    /// exist therefore throws this signal away and leaves every resolution tier
+    /// keyed onto the dead pre-/clear session.
     /// </summary>
     private static async Task MaybeRepointLiveSlotAsync(
         string projectId, string newSessionId,
@@ -150,38 +155,32 @@ public static class InternalHooksEndpoints
         try
         {
             // Only when the bridge (tmux) owns the slot. PC-side hooks reach this
-            // bridge too — they must not move the marker.
+            // bridge too — they must not move the marker. This (not a file check)
+            // is what keeps a foreign PC session id out.
             var (owner, _, _) = await ownership.ResolveAsync(projectId, db, tmux, scanner, ct);
             if (owner != SessionOwnershipRegistry.Owner.Tmux)
                 return;
 
             var row = await db.SessionOwnerships
                 .FirstOrDefaultAsync(x => x.ProjectId == projectId, ct);
-            if (row is null)
-                return;  // untracked: Tier-2 (newest last-record) already follows the switch
-            if (string.Equals(row.SessionUuid, newSessionId, StringComparison.OrdinalIgnoreCase))
+            if (row is not null
+                && string.Equals(row.SessionUuid, newSessionId, StringComparison.OrdinalIgnoreCase))
                 return;  // already pointed there
 
-            // The new session's JSONL must exist in this project's dir — guards a
-            // SessionStart that beats CC's first write, and foreign (PC) session ids.
-            var active = await scanner.ResolveAsync(projectId, ct);
-            if (active is null)
-                return;
-            var newPath = Path.Combine(active.EncodedCwdDir, newSessionId + ".jsonl");
-            if (!File.Exists(newPath))
-                return;
+            // Untracked projects (no row) get one created rather than skipped: they
+            // are NOT self-healing via Tier-2 as previously assumed. Tier-2 ranks by
+            // last-record timestamp, and a just-created session has no file at all —
+            // so the old session outranks it until the first message lands.
+            var oldUuid = row?.SessionUuid;
+            await ownership.SetTmuxAsync(projectId, newSessionId,
+                "activity-hook:sessionstart", db, ct);
 
-            var oldUuid = row.SessionUuid;
-            row.SessionUuid = newSessionId;
-            row.SinceUtc = DateTimeOffset.UtcNow;
-            row.ChangedByClient = "activity-hook:sessionstart";
-            await db.SaveChangesAsync(ct);
-
-            // JsonlWatcher.PumpAsync now re-resolves to the new path and emits a
-            // session_switch frame; the PWA reloads onto the new session.
+            // SessionScanner now resolves to the pinned session even though its file
+            // is still absent; JsonlWatcher.PumpAsync re-resolves and emits a
+            // session_switch frame, and the PWA reloads onto the new (empty) session.
             log.LogInformation(
                 "Live-slot re-pointed for {Project}: {Old} -> {New} (SessionStart)",
-                projectId, oldUuid, newSessionId);
+                projectId, oldUuid ?? "(untracked)", newSessionId);
         }
         catch (Exception ex)
         {
@@ -224,16 +223,26 @@ public static class InternalHooksEndpoints
         // CC fires the Notification hook for TWO different events:
         //   1) Genuine input request — permission prompt, AskUserQuestion.
         //      Message ~= "Claude needs your permission to use <Tool>"
-        //   2) Idle ping after 60s of inactivity even when CC isn't asking anything.
-        //      Message == "Claude is waiting for your input"
-        // The idle ping is a false positive for our needsInput banner — CC has nothing
-        // pending, the user just hasn't typed anything. Detect by message text and
-        // short-circuit so we don't flip needsInput=true or fan out Web Push.
+        //   2) Idle ping after ~60s of inactivity even when CC isn't asking
+        //      anything. Historically "Claude is waiting for your input", but
+        //      CC v2.1.214 also fires these with an EMPTY message (observed
+        //      2026-07-18: CortexBridge's needsInput banner kept re-appearing with
+        //      notificationMessage=null while the session sat at a clean idle
+        //      composer between turns).
+        // Both are false positives for the needsInput banner — CC has nothing
+        // pending, the user just hasn't typed. Skip so we don't flip
+        // needsInput=true or fan out Web Push. A GENUINE permission prompt
+        // always carries a non-empty "needs your permission …" message, and a
+        // real AskUserQuestion/permission pane is Blocked — so the
+        // ProcessingWatchdog Blocked-sweep surfaces it within ~30s regardless.
+        // Skipping empty/idle notifications here therefore cannot strand a
+        // real prompt; it only removes the spurious idle banner.
         var msgLower = (payload.Message ?? "").ToLowerInvariant();
-        var isIdlePing = msgLower.Contains("waiting for your input");
+        var isIdlePing = msgLower.Contains("waiting for your input")
+            || string.IsNullOrWhiteSpace(payload.Message);
         if (isIdlePing)
         {
-            log.LogDebug("Skipping idle ping for {Project} (message='{Message}')",
+            log.LogDebug("Skipping idle/empty notification for {Project} (message='{Message}')",
                 payload.ProjectId, payload.Message);
             return Results.Json(new { acceptedAt = DateTimeOffset.UtcNow.ToString("o"), idlePing = true },
                 Json.Default, statusCode: 202);

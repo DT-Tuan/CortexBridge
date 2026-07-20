@@ -232,8 +232,19 @@ public static class StreamEndpoint
                             state.SetProcessing(projectId, true, active.SessionUuid);
                             break;
                         case PaneClassifier.PaneState.Blocked:
-                            state.SetNeedsInput(projectId, true, sessionUuid: active.SessionUuid);
+                        {
+                            // This seed bypasses the watchdog's consecutive-scan
+                            // debounce, so confirm on a second capture: a single
+                            // mid-redraw frame at connect time must not re-arm
+                            // the banner (same defect class as the 2026-07-18
+                            // re-asked-AskUserQuestion incident). A real picker
+                            // is static — 400ms later it still classifies Blocked.
+                            await Task.Delay(TimeSpan.FromMilliseconds(400), ctx.RequestAborted);
+                            var confirm = await tmux.CapturePaneAsync(projectId, ctx.RequestAborted);
+                            if (PaneClassifier.Classify(confirm) == PaneClassifier.PaneState.Blocked)
+                                state.SetNeedsInput(projectId, true, sessionUuid: active.SessionUuid);
                             break;
+                        }
                     }
                 }
                 catch (TmuxException) { /* transient — snapshot falls back to hook state */ }
@@ -280,15 +291,27 @@ public static class StreamEndpoint
                 {
                     while (!ctx.RequestAborted.IsCancellationRequested)
                     {
-                        var live = state.Processing(projectId) && !state.NeedsInput(projectId);
+                        // Two live modes share this loop:
+                        //  - Processing (running turn): show the work TAIL (Tail
+                        //    strips the input box → the streaming text/tool run).
+                        //  - NeedsInput (open picker): show the PICKER itself so
+                        //    the PWA "raw TUI remote" reflects each keypress. This
+                        //    is the OPPOSITE region — PickerView KEEPS the box that
+                        //    Tail removes (cursor/checkbox/tab-bar/footer). Without
+                        //    this the remote is blind (livePane empty during a
+                        //    Blocked picker) — the whole point of the redesign.
+                        var needs = state.NeedsInput(projectId);
+                        var live = needs || state.Processing(projectId);
                         if (live)
                         {
                             string[] tail = [];
                             try
                             {
                                 if (await tmux.WindowExistsAsync(projectId, ctx.RequestAborted))
-                                    tail = PanePreview.Tail(
-                                        await tmux.CapturePaneAsync(projectId, ctx.RequestAborted));
+                                {
+                                    var pane = await tmux.CapturePaneAsync(projectId, ctx.RequestAborted);
+                                    tail = needs ? PanePreview.PickerView(pane) : PanePreview.Tail(pane);
+                                }
                             }
                             catch (TmuxException) { /* transient — try next tick */ }
 

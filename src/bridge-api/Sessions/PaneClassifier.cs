@@ -54,17 +54,51 @@ public static class PaneClassifier
 
     // An interactive menu/prompt is OPEN and waiting on the user:
     //   - permission prompt + folder-trust + AskUserQuestion all render a
-    //     cursor-marked numbered option ("❯ 1." / "> 2)")
+    //     cursor-marked numbered option ("❯ 1.")
     //   - AskUserQuestion adds "Ready to submit your answers?" / "Tab to amend"
     //   - select-menu footer "Enter to select" / "Esc to cancel"
     // None of these fire the activity hook, and AskUserQuestion fires no
     // Notification hook either — that is S1, so the watchdog must SURFACE it
     // (needsInput) rather than clear it.
-    private static readonly Regex BlockedRe = new(
-        @"esc to cancel|enter to select|tab to amend|ready to submit your answers"
-        + @"|do you want to (?:proceed|allow|create|run|make)"
-        + @"|^\s*[❯>›»‣]\s*\d{1,2}[.)]\s",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Multiline);
+    //
+    // Every marker is STRUCTURAL, not free-text (live failure 2026-07-18: a
+    // session whose transcript merely DISPLAYED these words — printed source
+    // code, a markdown "> 1." quote, prose discussing permission prompts —
+    // re-armed needsInput every watchdog sweep, re-asking an already-answered
+    // AskUserQuestion in the PWA):
+    //   - cursor options accept only CC's real cursor glyphs, never plain ">"
+    //     (markdown blockquotes);
+    //   - footer hint phrases count only on a SHORT standalone line — real
+    //     hints ("↑/↓ Enter to select · Esc to cancel") never exceed it,
+    //     transcript prose/code lines containing the words do;
+    //   - a "Do you want to …" heading counts only with a numbered option
+    //     line within the next few lines, as a real dialog always renders.
+
+    // CC's real menu cursor glyphs. Plain ">" is deliberately absent.
+    private static readonly Regex CursorOptionRe =
+        new(@"^\s*[❯›»‣]\s*\d{1,2}[.)]\s", RegexOptions.Compiled | RegexOptions.Multiline);
+
+    // A numbered option line, with or without the cursor ("  2. Yes, and …").
+    private static readonly Regex OptionLineRe =
+        new(@"^\s*(?:[❯›»‣]\s*)?\d{1,2}[.)]\s\S", RegexOptions.Compiled);
+
+    private static readonly Regex HintPhraseRe = new(
+        @"esc to cancel|enter to select|tab to amend|ready to submit your answers",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // Real footer hints are short standalone lines — the longest observed on
+    // this setup is "Ready to submit your answers?  ·  Tab to amend" (46).
+    // Anything longer is transcript content that happens to contain the words
+    // (e.g. a session printing THIS file's regex source, 74 chars trimmed).
+    // Pickers additionally carry the cursor-option signal, so a hypothetical
+    // over-long real footer still would not go undetected.
+    private const int HintLineMaxLen = 60;
+
+    private static readonly Regex DialogHeadRe = new(
+        @"do you want to (?:proceed|allow|create|run|make)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // How far below a "Do you want to …" heading a real dialog's first
+    // numbered option can sit (blank line + option block).
+    private const int DialogOptionLookahead = 5;
 
     // Positive confirmation of CC's clean empty composer (post /clear,
     // /compact, /exit, or crash-respawn). Used only to distinguish a
@@ -122,8 +156,51 @@ public static class PaneClassifier
         var region = LiveRegion(pane);
         if (string.IsNullOrWhiteSpace(region)) return PaneState.Idle;
         if (WorkingRe.IsMatch(region)) return PaneState.Working;
-        if (BlockedRe.IsMatch(region)) return PaneState.Blocked;
+        if (DescribeBlocked(region) is not null) return PaneState.Blocked;
         return PaneState.Idle;
+    }
+
+    /// <summary>
+    /// The STRUCTURAL Blocked evidence found in an already-extracted live
+    /// region, as a short marker name for diagnostics ("cursor-option",
+    /// "hint:esc to cancel", "dialog+options") — or null when none. The
+    /// marker never contains pane content, so it is safe to log.
+    /// </summary>
+    public static string? DescribeBlocked(string region)
+    {
+        if (CursorOptionRe.IsMatch(region)) return "cursor-option";
+
+        var lines = region.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var trimmed = lines[i].Trim();
+            if (trimmed.Length == 0) continue;
+
+            if (trimmed.Length <= HintLineMaxLen)
+            {
+                var hint = HintPhraseRe.Match(trimmed);
+                if (hint.Success) return "hint:" + hint.Value.ToLowerInvariant();
+            }
+
+            if (DialogHeadRe.IsMatch(trimmed))
+            {
+                var hi = Math.Min(lines.Length, i + 1 + DialogOptionLookahead);
+                for (var j = i + 1; j < hi; j++)
+                    if (OptionLineRe.IsMatch(lines[j])) return "dialog+options";
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Diagnostic wrapper for callers holding a raw pane: the Blocked marker
+    /// in its live region, or null. See <see cref="DescribeBlocked(string)"/>.
+    /// </summary>
+    public static string? BlockedMarker(string? pane)
+    {
+        var region = LiveRegion(pane);
+        return string.IsNullOrWhiteSpace(region) || WorkingRe.IsMatch(region)
+            ? null : DescribeBlocked(region);
     }
 
     /// <summary>
@@ -137,6 +214,6 @@ public static class PaneClassifier
         return !string.IsNullOrWhiteSpace(region)
             && IdleRe.IsMatch(region)
             && !WorkingRe.IsMatch(region)
-            && !BlockedRe.IsMatch(region);
+            && DescribeBlocked(region) is null;
     }
 }

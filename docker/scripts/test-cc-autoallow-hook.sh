@@ -113,7 +113,6 @@ expect prompt "git commit (no auton)" Bash "$(bash_in 'git commit -m x')"
 echo "-- unsafe Bash still prompts (the cases that matter) --"
 expect prompt "rm"               Bash "$(bash_in 'rm -rf /tmp/x')"
 expect prompt "git push (write)" Bash "$(bash_in 'git push origin main')"
-expect prompt "find (excluded)"  Bash "$(bash_in 'find . -name x')"
 expect prompt "sort -o (writes)" Bash "$(bash_in 'sort -o out.txt in.txt')"
 expect prompt "lone & background" Bash "$(bash_in 'sleep 5 & ls')"
 expect prompt "semicolon -> rm"  Bash "$(bash_in 'ls; rm -rf /')"
@@ -139,6 +138,37 @@ expect prompt "jq on .env"       Bash "$(bash_in 'jq . .env')"
 expect prompt "env->cat secret"  Bash "$(bash_in 'env X=1 cat ~/.ssh/id_rsa')"
 expect allow  "cat normal file"  Bash "$(bash_in 'cat README.md')"
 expect allow  "ls .ssh (no read)" Bash "$(bash_in 'ls -la /home/x/.ssh')"
+
+echo "-- Fix1: quote-aware metachar (quoted parens/redirect in patterns allowed) --"
+expect allow  "grep quoted paren"    Bash "$(bash_in 'grep -rn "Foo(" src/')"
+expect allow  "grep single-q paren"  Bash "$(bash_in "grep 'bar(\$x)' file")"
+expect allow  "cd && grep paren"     Bash "$(bash_in 'cd /w/proj && grep "Method(" src')"
+expect allow  "git --format paren"   Bash "$(bash_in 'git log --format="%(align)%H"')"
+expect allow  "grep quoted redirect" Bash "$(bash_in 'grep "a>b" file')"
+expect allow  "escaped \$ in dquote"  Bash "$(bash_in 'echo "a\$b"')"
+expect allow  "single-quoted subst literal" Bash "$(bash_in "echo 'a\$(b)'")"
+# security: substitution/redirect/subshell/background must STILL prompt (quote-aware != blanket-off)
+expect prompt "subst ACTIVE in dquote"  Bash "$(bash_in 'echo "$(rm -rf x)"')"
+expect prompt "backtick ACTIVE in dquote" Bash "$(bash_in 'echo "`id`"')"
+expect prompt "var-expand in dquote"    Bash "$(bash_in 'echo "$HOME"')"
+expect prompt "unquoted subshell"       Bash "$(bash_in '(rm -rf x)')"
+expect prompt "unterminated quote"      Bash "$(bash_in 'grep "foo')"
+expect prompt "quoted-then-unquoted subst" Bash "$(bash_in 'grep "ok" && echo $(id)')"
+
+echo "-- Fix2: read-only find/sort via arg inspection --"
+expect allow  "find read-only"       Bash "$(bash_in 'find src -type f -name "*.cs"')"
+expect prompt "find -delete"         Bash "$(bash_in 'find . -delete')"
+expect prompt "find -exec"           Bash "$(bash_in 'find . -exec rm {} ;')"
+expect allow  "sort read-only"       Bash "$(bash_in 'sort data.txt')"
+expect prompt "sort --output writes" Bash "$(bash_in 'sort --output=out data')"
+expect prompt "sed excluded (mini-lang)" Bash "$(bash_in 'sed -n 1,5p f')"
+
+echo "-- interactive/meta tools NEVER auto-allowed, even from a poisoned learned file --"
+echo '{"bashCommands":[],"tools":["AskUserQuestion","ExitPlanMode","Read"]}' > "$TMP/cortex-autoallow/proj.learned.json"
+expect prompt "AskUserQuestion (poisoned learned)" AskUserQuestion '{}'
+expect prompt "ExitPlanMode (poisoned learned)"    ExitPlanMode    '{}'
+expect allow  "Read still allowed (RO tier)"       Read            '{"file_path":"/x"}'
+rm -f "$TMP/cortex-autoallow/proj.learned.json"
 
 echo "== AUTONOMY tier (.on + .autonomy) =="
 set_flags on autonomy

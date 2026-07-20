@@ -196,6 +196,20 @@ public static class LearnedAutoAllow
     private const string FileSuffix = ".learned.json";
     private static readonly Lock _lock = new();
 
+    /// <summary>
+    /// Tools that must NEVER be learned/auto-allowed, whatever the PWA sends. These
+    /// are INTERACTIVE, user-facing tools whose entire purpose is to elicit a user
+    /// decision (AskUserQuestion) or gate a plan (ExitPlanMode). Auto-allowing one is
+    /// a category error: it does not "run a safe action", it silently bypasses the
+    /// interaction the tool exists for — and empirically corrupts the AskUserQuestion
+    /// → PWA surfacing flow (a learned AskUserQuestion got a PreToolUse allow on every
+    /// call). The digit-answer path used to record whatever tool was pending, so an
+    /// answered single-select AskUserQuestion taught the system to allow it; this set
+    /// is the server-side backstop. The hook carries the same denylist independently.
+    /// </summary>
+    public static readonly IReadOnlySet<string> NeverLearnTools =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "AskUserQuestion", "ExitPlanMode" };
+
     public record LearnRequest(string? Tool, string? Command);
 
     public record LearnedData
@@ -210,6 +224,9 @@ public static class LearnedAutoAllow
     /// </summary>
     public static void Append(string flagDir, string projectId, string tool, string command)
     {
+        // Interactive/meta tools are never learnable — see NeverLearnTools.
+        if (NeverLearnTools.Contains(tool)) return;
+
         var path = FilePath(flagDir, projectId);
         lock (_lock)
         {

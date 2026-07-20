@@ -59,6 +59,15 @@ LEARNED_FILE="$FLAG_DIR/$PROJECT_ID.learned.json"
 TOOL="$(jq -r '.tool_name // empty' <<<"$PAYLOAD" 2>/dev/null)"
 [ -n "$TOOL" ] || exit 0
 
+# NEVER auto-allow interactive/meta tools, even if a (stale) learned file lists one.
+# AskUserQuestion / ExitPlanMode exist to elicit a USER decision; a PreToolUse allow
+# on them silently bypasses that and corrupts the AskUserQuestion -> PWA surfacing
+# flow. Defense-in-depth: the bridge already refuses to learn them (NeverLearnTools),
+# this guards a file poisoned before that fix. Degrade to a normal prompt (exit 0).
+case "$TOOL" in
+  AskUserQuestion|ExitPlanMode) exit 0;;
+esac
+
 # --- allowlists ---------------------------------------------------------------
 # Read-only simple programs (matched by basename). `find` is EXCLUDED (-exec/-delete);
 # `sort` is EXCLUDED (-o/--output writes). git/env are handled specially below.
@@ -141,6 +150,28 @@ is_install_cmd() {
   return 1
 }
 
+# find is read-only EXCEPT the action flags that execute or write. `sed`/`awk` are
+# deliberately NOT added: they are mini-languages that can write (sed `w`, `-i`) or
+# execute (awk `system()`, sed `e`) from inside the script arg — not safely vettable
+# without parsing that script. Use the learned path for those instead.
+is_ro_find() {   # $@ = full argv including "find"
+  local t
+  for t in "${@:2}"; do
+    case "$t" in
+      -exec|-execdir|-ok|-okdir|-delete|-fprint|-fprintf|-fls|-fprint0) return 1;;
+    esac
+  done
+  return 0
+}
+# sort is read-only unless it writes back via -o/--output.
+is_ro_sort() {
+  local t
+  for t in "${@:2}"; do
+    case "$t" in -o|-o?*|--output|--output=*) return 1;; esac
+  done
+  return 0
+}
+
 # git config is read-only only when it carries a get/list flag (no value-set form).
 config_is_readonly() {
   local t
@@ -205,6 +236,15 @@ classify_tokens() {
     SEGRES=1; SEGWHY="autonomy:install $prog"; return
   fi
 
+  if [ "$RO_ON" = 1 ] && [ "$prog" = "find" ] && is_ro_find "$@"; then
+    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; return; fi
+    SEGRES=1; SEGWHY="read-only find"; return
+  fi
+  if [ "$RO_ON" = 1 ] && [ "$prog" = "sort" ] && is_ro_sort "$@"; then
+    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; return; fi
+    SEGRES=1; SEGWHY="read-only sort"; return
+  fi
+
   if [ "$RO_ON" = 1 ] && is_simple_safe "$prog"; then
     if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; return; fi
     SEGRES=1; SEGWHY="read-only $prog"; return
@@ -213,13 +253,52 @@ classify_tokens() {
   SEGRES=0; SEGWHY="$prog (not allowed)"
 }
 
+# Reject shell metacharacters that are dangerous OUTSIDE quotes — command
+# substitution $(...) / `...`, redirection < >, subshell ( ), backgrounding & —
+# with CORRECT quote semantics so a QUOTED paren/redirect in a search pattern
+# (grep "Foo(" / grep 'a>b') is NOT a false reject. Bash rules honored:
+#   single quotes  -> everything literal (safe);
+#   double quotes  -> $ and ` STILL active (subst/expand, unsafe) but ( ) < > & literal;
+#   backslash      -> escapes the next char (outside quotes, and $ ` " \ inside "").
+# && is a segment separator (allowed here; the split handles it); a lone & is not.
+# ; and | are separators too and are intentionally NOT flagged here — the per-segment
+# split + classify + is_destructive floor still gate each piece, so anything the
+# quote-agnostic split mis-cuts fails to classify and PROMPTS (fails safe, never allows).
+# Returns 0 if an unsafe metachar is present, 1 if clean.
+has_unsafe_metachar() {
+  local s="$1"; local n=${#s} i=0 c st=N   # st: N=none  S=single-quote  D=double-quote
+  #                ^ separate stmt: `local s=.. n=${#s}` evaluates ${#s} before s is set (n=0)
+  while [ "$i" -lt "$n" ]; do
+    c="${s:$i:1}"
+    case "$st" in
+      N)
+        case "$c" in
+          \\) i=$((i+2)); continue;;                      # unquoted escape: skip next
+          \') st=S;;
+          \") st=D;;
+          '$'|'`'|'<'|'>'|'('|')') return 0;;             # active subst/redirect/subshell
+          '&') [ "${s:$((i+1)):1}" = "&" ] && i=$((i+1)) || return 0;;  # && ok, lone & no
+        esac;;
+      S)  case "$c" in \') st=N;; esac;;                   # single quote: all literal
+      D)
+        case "$c" in
+          \\) i=$((i+2)); continue;;                       # dq escape: skip next
+          '$'|'`') return 0;;                              # still active inside ""
+          \") st=N;;
+        esac;;                                             # ( ) < > & literal inside ""
+    esac
+    i=$((i+1))
+  done
+  [ "$st" = N ] || return 0   # unterminated quote -> reject
+  return 1
+}
+
 # Classify a full Bash command line (may be a && || ; | chain) -> 0 (allow) + ALLREASON.
 classify_command() {
   local cmd="$1"
   [ -n "$cmd" ] || return 1
   case "$cmd" in *$'\n'*|*$'\r'*) return 1;; esac          # 2nd line would run unseen
-  case "$cmd" in *[\<\>\`\$\(\)]*) return 1;; esac          # redirect/subst/subshell
-  case "${cmd//&&/}" in *"&"*) return 1;; esac              # lone & = backgrounding
+  has_unsafe_metachar "$cmd" && return 1                   # subst/redirect/subshell/bg (quote-aware)
 
   local sep=$'\x01' norm="$cmd"
   norm="${norm//&&/$sep}"; norm="${norm//||/$sep}"; norm="${norm//;/$sep}"; norm="${norm//|/$sep}"

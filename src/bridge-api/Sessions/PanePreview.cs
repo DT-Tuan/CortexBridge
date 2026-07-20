@@ -75,6 +75,32 @@ public static class PanePreview
         return outp.ToArray();
     }
 
+    /// <summary>
+    /// The picker region for the PWA "raw TUI remote" — the OPPOSITE of
+    /// <see cref="Tail"/>. An open interactive picker (permission prompt /
+    /// AskUserQuestion) renders INSIDE the bottom input-box block that Tail
+    /// deliberately strips: the "❯ 1. [✔] Alpha" cursor lines, the checkbox
+    /// glyphs, the "☒ Test ✔ Submit" tab bar, the "Enter to select" footer.
+    /// The raw remote's whole value is letting the user SEE those update as they
+    /// press keys, so here we KEEP them: return the last <paramref name="maxLines"/>
+    /// visible lines verbatim (only right-trimmed of box padding, blank lines
+    /// dropped), preserving the cursor/checkbox/tab chrome. Pure + static.
+    /// </summary>
+    public static string[] PickerView(string? pane, int maxLines = 24)
+    {
+        if (string.IsNullOrWhiteSpace(pane)) return [];
+        var lines = pane.Replace("\r", string.Empty).Split('\n');
+        var outp = new List<string>();
+        for (var i = lines.Length - 1; i >= 0 && outp.Count < maxLines; i--)
+        {
+            var c = lines[i].TrimEnd('│', ' ', '\t');
+            if (c.Trim().Length == 0) continue;      // skip blank padding rows
+            outp.Add(c.Length > 200 ? c[..200] + "…" : c);
+        }
+        outp.Reverse();
+        return outp.ToArray();
+    }
+
     private static string Clean(string s)
     {
         s = s.TrimEnd('│', '─', '╌', '╎', ' ', '\t');

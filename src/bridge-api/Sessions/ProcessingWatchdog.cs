@@ -84,6 +84,41 @@ public sealed class ProcessingWatchdog(
     // persists and is caught next tick.
     private static readonly TimeSpan RecentActivityWindow = TimeSpan.FromSeconds(10);
 
+    // Debounce for surfacing needsInput from a pane read: require the SAME
+    // Blocked classification on this many CONSECUTIVE scans before believing
+    // it. A real stuck picker persists for minutes, so the added latency is
+    // one scan interval; a transient misread (mid-redraw frame, adversarial
+    // transcript content — live failure 2026-07-18 re-asked an answered
+    // AskUserQuestion every sweep) never survives two. Keyed per project;
+    // reset by any non-Blocked classification. Only the watchdog loop touches
+    // it — no locking needed.
+    private const int BlockedStreakToSurface = 2;
+    // Two observations only count as CONSECUTIVE when they are at most this far
+    // apart — a residual count must not pair with a transient minutes later
+    // (finder finding 2026-07-18: a streak bumped once, left un-scanned for a
+    // while, then confirmed by an unrelated transient = debounce bypassed).
+    private static readonly TimeSpan BlockedStreakMaxGap = ScanInterval * 2 + TimeSpan.FromSeconds(5);
+    private readonly Dictionary<string, (int Count, DateTimeOffset At)> _blockedStreak =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Bump the project's consecutive-Blocked counter; true once it
+    /// reaches <see cref="BlockedStreakToSurface"/>. A stale prior observation
+    /// (older than <see cref="BlockedStreakMaxGap"/>) restarts the streak. The
+    /// caller resets after surfacing so the NEXT arming needs a fresh streak
+    /// (finder finding 2026-07-18: without that, one confirm disabled the
+    /// debounce for every later re-arm).</summary>
+    private bool BlockedConfirmed(string projectId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var count = _blockedStreak.TryGetValue(projectId, out var prev)
+            && now - prev.At <= BlockedStreakMaxGap
+            ? prev.Count + 1 : 1;
+        _blockedStreak[projectId] = (count, now);
+        return count >= BlockedStreakToSurface;
+    }
+
+    private void ResetBlockedStreak(string projectId) => _blockedStreak.Remove(projectId);
+
     private async Task ReconcileAsync(CancellationToken ct)
     {
         var candidates = state.FindStaleProcessing(IdleThreshold);
@@ -122,6 +157,7 @@ public sealed class ProcessingWatchdog(
                 case PaneClassifier.PaneState.Working:
                     // S2: a single long tool-call/think. Real work — leave it.
                     // Re-checked every scan until the pane changes or Stop fires.
+                    ResetBlockedStreak(projectId);
                     _log.LogDebug(
                         "Watchdog: {Project} pane shows a running turn — keeping Processing",
                         projectId);
@@ -132,11 +168,26 @@ public sealed class ProcessingWatchdog(
                     // got NO hook for it, so promote the silent latch to the
                     // authoritative needsInput state — banner shows, composer
                     // stays gated, PWA's /prompt fetch renders the real options.
-                    state.SetNeedsInput(projectId, true, "Claude needs your input", sessionUuid);
-                    surfaced.Add(projectId);
+                    // Debounced: a real picker survives consecutive scans.
+                    if (BlockedConfirmed(projectId))
+                    {
+                        state.SetNeedsInput(projectId, true, "Claude needs your input", sessionUuid);
+                        surfaced.Add(projectId);
+                        ResetBlockedStreak(projectId); // next arming needs a fresh streak
+                        _log.LogInformation(
+                            "Watchdog: {Project} stale-pass Blocked confirmed (marker={Marker})",
+                            projectId, PaneClassifier.BlockedMarker(pane) ?? "?");
+                    }
+                    else
+                    {
+                        _log.LogDebug(
+                            "Watchdog: {Project} pane Blocked once (marker={Marker}) — awaiting confirmation",
+                            projectId, PaneClassifier.BlockedMarker(pane) ?? "?");
+                    }
                     break;
 
                 default: // Idle
+                    ResetBlockedStreak(projectId);
                     var confident = PaneClassifier.IsConfidentIdle(pane);
                     state.SetProcessing(projectId, false, sessionUuid);
                     cleared.Add(projectId);
@@ -210,7 +261,24 @@ public sealed class ProcessingWatchdog(
 
             var pane = await TryCapturePaneAsync(projectId, ct);
             if (pane is null) continue;
-            if (PaneClassifier.Classify(pane) != PaneClassifier.PaneState.Blocked) continue;
+            if (PaneClassifier.Classify(pane) != PaneClassifier.PaneState.Blocked)
+            {
+                ResetBlockedStreak(projectId);
+                continue;
+            }
+            // Debounce: only a picker that survives consecutive sweeps is real
+            // (transient misreads re-asked an answered AskUserQuestion — live
+            // failure 2026-07-18).
+            if (!BlockedConfirmed(projectId))
+            {
+                _log.LogDebug(
+                    "Watchdog Blocked-sweep: {Project} Blocked once (marker={Marker}) — awaiting confirmation",
+                    projectId, PaneClassifier.BlockedMarker(pane) ?? "?");
+                continue;
+            }
+            _log.LogInformation(
+                "Watchdog Blocked-sweep: {Project} confirmed (marker={Marker})",
+                projectId, PaneClassifier.BlockedMarker(pane) ?? "?");
 
             // Resolve the active VM sessionUuid so SetNeedsInput keys onto
             // the same (projectId, sessionUuid) entry that the PWA queries.
@@ -225,6 +293,7 @@ public sealed class ProcessingWatchdog(
             var resolved = await scanner.ResolveAsync(projectId, ct);
             state.SetNeedsInput(projectId, true, "Claude needs your input", resolved?.SessionUuid);
             surfaced.Add(projectId);
+            ResetBlockedStreak(projectId); // next arming needs a fresh streak
         }
 
         if (surfaced.Count > 0)

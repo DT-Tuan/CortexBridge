@@ -215,6 +215,9 @@
 		// CC's analysis prose printed above the picker, scraped from the pane
 		// (it isn't in JSONL until the question is answered). Best-effort.
 		askContext?: string | null;
+		// VISIBLE menu is multiSelect (checkbox options): a digit only TOGGLES —
+		// taps must go through sendToggle() + submitPicker(), never sendChoice().
+		multi?: boolean;
 	};
 	let livePrompt = $state<LivePrompt | null>(null);
 	// True from the moment needsInput flips until the live /prompt fetch
@@ -587,11 +590,21 @@
 					serverStatusSeen = true;
 					// Defensive: if the turn ended, drop the live preview even
 					// if the backend's empty pane_preview frame is delayed/lost.
-					if (!serverProcessing) livePane = [];
+					// BUT keep it while a picker is open (needsInput): the backend
+					// now streams the picker region as pane_preview so the raw-TUI
+					// remote can show CC's screen — clearing on processing=false
+					// (a picker is Blocked, not Processing) would blind it.
+					if (!serverProcessing && !s.needsInput) livePane = [];
 				},
 				onOwnerChange: (o) => {
 					owner = o.owner;
 					takeoverSafe = o.takeoverSafe ?? false;
+					// A /clear re-points the live-slot marker, which fires this frame.
+					// No JSONL is written until the first prompt, so no session_switch
+					// frame can follow it — without this the switch waits on the 15s
+					// poll. reconcileFromRest is self-guarding (it only acts when the
+					// REST active session really differs while we're un-pinned).
+					reconcileFromRest().catch(() => {});
 				},
 				onSessionSwitch: () => {
 					// issue #1: CC switched sessions (e.g. /clear) in the same tmux
@@ -1040,9 +1053,13 @@
 		if (livePrompt?.isAsk) {
 			const secs = livePrompt.askSections ?? [];
 			const qs = livePrompt.askQuestions ?? [];
-			// One section = one question; treat as single-select unless the parsed
-			// question is explicitly multiSelect.
-			return secs.length === 1 && (qs.length === 0 || !qs[0]?.multi);
+			// One section = one question — but a single-question multiSelect ask
+			// STILL renders the tab bar (isAsk=true, 1 section) with checkbox
+			// options, and there a digit only TOGGLES (never submits). Verified
+			// live on scratch-project 2026-07-18: treating it as single-select sent
+			// tap→sendChoice→optimistic dismiss = the "panel pops back, can't
+			// pick multiple" loop. livePrompt.multi is the pane ground truth.
+			return secs.length === 1 && !livePrompt.multi && (qs.length === 0 || !qs[0]?.multi);
 		}
 		return false;
 	});
@@ -1197,6 +1214,46 @@
 	// which sends the digit as a RAW keystroke — a CC menu reads number keys as
 	// accelerators. The old path pasted the digit as a free-text reply, which the
 	// menu interpreted as a cancel → "[Request interrupted]" → stuck "thinking".
+	// multiSelect picker (livePrompt.multi): a digit only TOGGLES that option's
+	// checkbox in the CC TUI — it never submits. So a toggle-tap must NOT run
+	// sendChoice's optimistic needsInput-clear (that's what made the panel
+	// "dismiss then pop back" — live failure 2026-07-18); the panel stays open,
+	// the toggled set mirrors locally, and submitPicker() (Enter) confirms.
+	let multiPicked = $state<Set<number>>(new Set());
+
+	// CC appends its own chrome rows to the picker's numbered list ("4. Type
+	// something", "5. Chat about this", the "Submit" row) and ParseVisible's
+	// consecutive-number walk picks them up. Never render them as answers —
+	// toggling "Type something" opens the TUI text input remotely.
+	function isPickerChromeOption(label: string): boolean {
+		return /^(type something|chat about this|submit)$/i.test(stripTableChars(label).trim());
+	}
+
+	async function sendToggle(digit: number) {
+		if (sending || isModeB) return;
+		hapticTick();
+		sending = true;
+		try {
+			await tryActivateOn409(() =>
+				sessionsApi.choice(projectId, digit, requestedSessionUuid ?? undefined)
+			);
+			const next = new Set(multiPicked);
+			if (next.has(digit)) next.delete(digit);
+			else next.add(digit);
+			multiPicked = next;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			sending = false;
+		}
+	}
+
+	// Interactive/meta tools must never be taught to auto-allow: their whole point is
+	// to elicit a user decision, and a PreToolUse allow on them corrupts the
+	// AskUserQuestion flow. Mirrors the backend NeverLearnTools + hook denylist — this
+	// is the source-side guard so we never even send them to /autoallow/learn.
+	const NEVER_LEARN_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
+
 	async function sendChoice(digit: number) {
 		if (sending || isModeB) return;
 		hapticTick();
@@ -1214,13 +1271,29 @@
 			dismissDeviceNotification();
 			// Fire-and-forget: learn this approval so the hook can auto-allow
 			// it next time. Non-fatal — failure just means it prompts again.
-			if (learnTool) {
+			if (learnTool && !NEVER_LEARN_TOOLS.has(learnTool.name)) {
 				sessionsApi
 					.learnAutoAllow(projectId, learnTool.name, learnTool.details)
 					.catch(() => { /* non-fatal */ });
 			}
 		} catch (e) {
 			needsInput = true;
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			sending = false;
+		}
+	}
+
+	// Raw TUI remote: pass one key through to CC's real picker. Digits toggle
+	// (multiSelect) or select; arrows/Tab/Enter drive Submit — human watches
+	// the live pane. Does NOT clear needsInput (a mid-picker toggle is normal).
+	async function pickerKey(k: string) {
+		if (sending || isModeB) return;
+		hapticTick();
+		sending = true;
+		try {
+			await tryActivateOn409(() => sessionsApi.key(projectId, k, requestedSessionUuid ?? undefined));
+		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			sending = false;
@@ -1305,6 +1378,7 @@
 		// pending so the banner withholds the generic fallback until we know.
 		livePrompt = null;
 		livePromptPending = true;
+		multiPicked = new Set(); // new prompt cycle — clear multiSelect toggles
 		(async () => {
 			try {
 				for (let attempt = 0; attempt < 4 && !cancelled; attempt++) {
@@ -1745,68 +1819,7 @@
 				{notificationMessage}
 			</div>
 		{/if}
-		{#if askUserQuestion}
-			<!-- AskUserQuestion runs as an interactive picker in CC's TUI (arrow nav + Enter
-			     for each question, then Submit tab). PWA can't reliably drive that via
-			     tmux paste-buffer — text replies get partially consumed by the picker and
-			     leave it stuck mid-question. Render READ-ONLY so user knows the questions,
-			     and instruct them how to answer cleanly. -->
-			<div class="space-y-2">
-				<div class="text-[11.5px] text-[var(--color-text)] bg-[var(--color-warning)]/10 border border-[var(--color-warning)]/40 rounded-md p-2 leading-snug">
-					{#if askSingleSelect}<b>1 câu</b> — chạm đáp án để <b>gửi luôn</b> (không cần bấm Gửi). Muốn trả lời khác thì dùng "Huỷ picker" bên dưới.{:else}<b>{askUserQuestion.questions.length} câu hỏi</b> — chạm chọn cho <b>TỪNG câu</b> (điền vào ô soạn) rồi bấm <b>Gửi</b>. Phải trả lời đủ cả {askUserQuestion.questions.length} câu thì CC mới tiếp tục.{/if}
-				</div>
-				<!-- Bounded scroll: a long N-question list must not push the
-				     cancel/Send actions off-screen. Header+hint+Huỷ-picker stay
-				     OUTSIDE this box → always visible & tappable. -->
-				<div class="max-h-[44vh] overflow-y-auto overscroll-contain space-y-2 -mx-1 px-1">
-				{#each askUserQuestion.questions as q, qi (qi)}
-					{@const total = askUserQuestion.questions.length}
-					<div class="rounded-md bg-[var(--color-bg)]/60 border border-[var(--color-border)]/40 p-2">
-						<div class="flex items-baseline gap-2 mb-1.5">
-							<span class="font-mono text-[10px] text-[var(--color-warning)] shrink-0">Q{qi + 1}/{total}</span>
-							<div class="text-[12.5px] font-medium text-[var(--color-text)] leading-snug">
-								{q.question}{#if q.multiSelect} <span class="text-[10px] font-normal text-[var(--color-text-dim)]">(chọn nhiều)</span>{/if}
-							</div>
-						</div>
-						<div class="flex flex-col gap-1.5">
-							{#each q.options as opt, oi (oi)}
-								<button
-									type="button"
-									onclick={() => (askSingleSelect ? sendChoice(oi + 1) : addOptionToComposer(qi, total, stripTableChars(opt.label), !!q.multiSelect))}
-									disabled={sending}
-									class="min-h-[38px] px-3 py-2 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] hover:border-[var(--color-accent)]/60 text-left text-[var(--color-text)] disabled:opacity-50 active:scale-[0.99] transition flex items-start gap-3"
-								>
-									<span class="text-[var(--color-accent)]/70 font-mono text-[12px] shrink-0 mt-0.5">{oi + 1}.</span>
-									<span class="flex-1 min-w-0">
-										<span class="block leading-snug">{stripTableChars(opt.label)}</span>
-										{#if opt.description}
-											<span class="block text-[11px] leading-snug text-[var(--color-text-dim)]">{opt.description}</span>
-										{/if}
-									</span>
-								</button>
-							{/each}
-						</div>
-					</div>
-				{/each}
-				</div>
-				<div class="text-[11px] text-[var(--color-text-dim)] leading-snug">
-					Chạm đáp án → điền "Q1: …", "Q2: …" vào ô soạn (sửa được). Hoặc gõ tự do. Bấm Gửi: bridge Esc picker của CC rồi gửi — nhớ trả lời đủ tất cả câu.
-				</div>
-				{#if askAnswer.active && askAnswer.missing.length}
-					<div class="text-[12px] text-[var(--color-warning)] bg-[var(--color-warning)]/10 border border-[var(--color-warning)]/40 rounded-md px-2 py-1.5 leading-snug">
-						⚠️ Còn thiếu: <b>{askAnswer.missing.join(', ')}</b> — điền/chạm hết rồi mới Gửi được.
-					</div>
-				{/if}
-				<button
-					type="button"
-					onclick={dismissPickerAndFocus}
-					disabled={sending}
-					class="min-h-[38px] w-full px-3 py-2 rounded-lg bg-[var(--color-warning)]/20 border border-[var(--color-warning)]/50 text-[var(--color-warning)] text-[13px] active:scale-[0.99] transition"
-				>
-					Huỷ picker + gõ trả lời tự do ↓
-				</button>
-			</div>
-		{:else if pendingTool && pendingTool.details}
+		{#if pendingTool && pendingTool.details}
 			<!-- Show the actual tool_use input — the bash command, file path, etc.
 			     Critical for permission decisions: "Allow Bash?" with no command shown
 			     is a security smell. Monospace + scrollable for long commands. -->
@@ -1817,110 +1830,101 @@
 				<pre class="font-mono text-[12.5px] text-[var(--color-text)] whitespace-pre-wrap break-all max-h-40 overflow-y-auto m-0">{pendingTool.details}</pre>
 			</div>
 		{/if}
-		{#if promptInfo?.question && promptInfo.question !== notificationMessage && !askUserQuestion && !livePromptPending}
-			<div class="text-[var(--color-text-dim)] whitespace-pre-wrap break-words text-[12.5px] leading-relaxed">
-				{promptInfo.question}
+		<!-- Interactive picker. RAW TUI REMOTE only for AskUserQuestion (the
+		     sole broken case): bridge is blind to it, so the user drives CC's
+		     real picker via /key + watches the live pane. Permission prompts /
+		     plain numbered menus were NEVER broken → keep the original one-tap
+		     sendChoice (digit = select+submit) path untouched. -->
+		{#if askUserQuestion || livePrompt?.isAsk || livePrompt?.multi}
+		<div class="flex flex-col gap-2 pt-1">
+			<div class="text-[11.5px] text-[var(--color-text)] bg-[var(--color-warning)]/10 border border-[var(--color-warning)]/40 rounded-md p-2 leading-snug">
+				Chạm số để chọn/tích một mục. Câu chọn-nhiều: chạm nhiều số rồi bấm → tới tab Submit và Enter (xem màn hình CC bên dưới).
 			</div>
-		{/if}
-		{#if askUserQuestion}
-			<!-- AskUserQuestion form already rendered above with tap-to-fill option buttons.
-			     No need for additional choice buttons; user fills composer via taps + Send. -->
-		{:else if livePrompt?.isAsk}
-			{@const secs = livePrompt.askSections ?? []}
-			{@const ans = livePrompt.askAnswered ?? 0}
-			{@const curSec = secs[ans] ?? secs[secs.length - 1] ?? ''}
-			{@const curTag = curSec || ('Câu ' + (ans + 1))}
-			<!-- Pending multi-question AskUserQuestion: not in JSONL yet, TUI
-			     shows one question at a time, picker undriveable remotely
-			     (ADR-015/16). User composes a per-section answer; on Send the
-			     bridge Esc-dismisses the picker then pastes it (ReplyEndpoints).
-			     Tapping an option fills that section's line. No "cancel". -->
-			<div class="flex flex-col gap-2 pt-1">
-				<div class="text-[12px] text-[var(--color-text)] bg-[var(--color-warning)]/10 border border-[var(--color-warning)]/40 rounded-md p-2 leading-snug">
-					📋 CC đang hỏi <b>{secs.length} câu</b>: <b>{secs.join(' / ')}</b>{#if ans > 0} · đã trả lời {ans}/{secs.length}{/if}.
-					<br />{#if (livePrompt.askQuestions?.length ?? 0) > 0}Chạm chọn đáp án cho <b>TỪNG câu</b> bên dưới (hoặc gõ), rồi bấm <b>Gửi</b>{:else}Chạm chọn / gõ cho <b>từng phần</b> rồi bấm <b>Gửi</b>{/if} — bridge tự Esc picker, gửi đủ cả {secs.length} câu (model map theo nhãn). Không cần “huỷ”.
-				</div>
-				{#if livePrompt.askContext}
-					<!-- CC's analysis prose above the picker. Not in JSONL until the
-					     question is answered, so the bridge scrapes it from the pane
-					     (PromptEndpoint.ExtractAskContext) — gives the context the
-					     questions refer to so the user can answer informed. -->
-					<details open class="text-[12px] rounded-md bg-[var(--color-bg)]/60 border border-[var(--color-border)]/40">
-						<summary class="cursor-pointer select-none px-2 py-1.5 text-[var(--color-text-dim)] font-medium">
-							🧠 Bối cảnh từ CC
-						</summary>
-						<div class="px-2 pb-2 whitespace-pre-wrap break-words text-[var(--color-text)] leading-relaxed max-h-[30vh] overflow-y-auto overscroll-contain">{livePrompt.askContext}</div>
-					</details>
-				{/if}
-				{#if (livePrompt.askQuestions?.length ?? 0) > 0}
-					<!-- Cuộn riêng vùng câu hỏi: N câu × nhiều option rất cao;
-					     giới hạn chiều cao để banner không tràn viewport, header/
-					     guard/nút vẫn cố định ngoài khung cuộn. -->
-					<div class="max-h-[44vh] overflow-y-auto overscroll-contain space-y-2 -mx-1 px-1">
-					{#each livePrompt.askQuestions ?? [] as q (q.index)}
-						{@const qSec = secs[q.index - 1] ?? ('Câu ' + q.index)}
+			{#if askUserQuestion}
+				<!-- JSONL path: questions as read-only reference. Digit buttons come
+				     from livePrompt.options (what the pane shows right now). -->
+				<div class="max-h-[28vh] overflow-y-auto overscroll-contain space-y-1.5 -mx-1 px-1">
+					{#each askUserQuestion.questions as q, qi (qi)}
+						{@const total = askUserQuestion.questions.length}
 						<div class="rounded-md bg-[var(--color-bg)]/60 border border-[var(--color-border)]/40 p-2">
-							<div class="text-[12.5px] font-medium text-[var(--color-text)] mb-1.5">
-								<span class="font-mono text-[10px] text-[var(--color-warning)] mr-1">Q{q.index}/{secs.length}</span>{q.question}{#if q.multi} <span class="text-[10px] font-normal text-[var(--color-text-dim)]">(chọn nhiều)</span>{/if}
-							</div>
-							{#if q.options.length > 0}
-								<div class="flex flex-col gap-1.5">
-									{#each q.options as opt (opt.num)}
-										<button
-											type="button"
-											onclick={() => (askSingleSelect ? sendChoice(opt.num) : askCompose(secs, qSec, stripTableChars(opt.label), q.multi))}
-											disabled={sending}
-											class="min-h-[38px] px-3 py-2 rounded-lg border text-left disabled:opacity-50 active:scale-[0.99] transition flex items-start gap-3 {askPicked(qSec, stripTableChars(opt.label)) ? 'bg-[var(--color-accent)]/15 border-[var(--color-accent)] text-[var(--color-text)]' : 'bg-[var(--color-surface)] border-[var(--color-border)] hover:border-[var(--color-accent)]/60 text-[var(--color-text)]'}"
-										>
-											<span class="font-mono text-[12px] text-[var(--color-accent)]/70 shrink-0 mt-0.5">{opt.num}.</span>
-											<span class="flex-1 break-words">{stripTableChars(opt.label)}</span>
-										</button>
-									{/each}
+							<div class="flex items-baseline gap-2 mb-1">
+								<span class="font-mono text-[10px] text-[var(--color-warning)] shrink-0">Q{qi + 1}/{total}</span>
+								<div class="text-[12.5px] font-medium text-[var(--color-text)] leading-snug">
+									{q.question}{#if q.multiSelect} <span class="text-[10px] font-normal text-[var(--color-text-dim)]">(chọn nhiều)</span>{/if}
 								</div>
-							{/if}
+							</div>
+							<ul class="space-y-0.5 pl-0 list-none m-0">
+								{#each q.options as opt, oi (oi)}
+									<li class="text-[12px] text-[var(--color-text-dim)] leading-snug flex gap-2">
+										<span class="font-mono text-[var(--color-accent)]/60 shrink-0">{oi + 1}.</span>
+										<span class="min-w-0">
+											{stripTableChars(opt.label)}
+											{#if opt.description}
+												<span class="block text-[11px] opacity-80">{opt.description}</span>
+											{/if}
+										</span>
+									</li>
+								{/each}
+							</ul>
 						</div>
 					{/each}
-					</div>
-				{:else}
-					{#if livePrompt.question}
-						<div class="text-[12.5px] font-medium text-[var(--color-text)]">{livePrompt.question}</div>
-					{/if}
-					{#if livePrompt.options.length > 0}
-						<div class="flex flex-col gap-1.5">
-							{#each livePrompt.options as opt (opt.num)}
-								<button
-									type="button"
-									onclick={() => (askSingleSelect ? sendChoice(opt.num) : askCompose(secs, curTag, stripTableChars(opt.label)))}
-									disabled={sending}
-									class="min-h-[38px] px-3 py-2 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] hover:border-[var(--color-accent)]/60 text-left text-[var(--color-text)] disabled:opacity-50 active:scale-[0.99] transition flex items-start gap-3"
-								>
-									<span class="font-mono text-[12px] text-[var(--color-accent)]/70 shrink-0 mt-0.5">{opt.num}.</span>
-									<span class="flex-1 break-words">{stripTableChars(opt.label)}</span>
-								</button>
-							{/each}
-						</div>
-					{/if}
-				{/if}
-				{#if askAnswer.active && askAnswer.missing.length}
-					<div class="text-[12px] text-[var(--color-warning)] bg-[var(--color-warning)]/10 border border-[var(--color-warning)]/40 rounded-md px-2 py-1.5 leading-snug">
-						⚠️ Còn thiếu: <b>{askAnswer.missing.join(', ')}</b> — điền/chạm hết rồi mới Gửi được.
-					</div>
-				{/if}
-				<button
-					type="button"
-					onclick={() => askCompose(secs)}
-					disabled={sending}
-					class="min-h-[38px] w-full px-3 py-2 rounded-lg bg-[var(--color-surface)] border border-dashed border-[var(--color-border)] text-[var(--color-text-dim)] text-[13px] active:scale-[0.99] transition"
-				>
-					Điền khung {secs.length} câu để gõ
-				</button>
+				</div>
+			{:else if livePrompt?.question}
+				<div class="text-[12.5px] font-medium text-[var(--color-text)] leading-snug">
+					{livePrompt.question}
+				</div>
+			{/if}
+			{#if livePrompt?.options?.length}
+				<div class="flex flex-col gap-1.5">
+					{#each livePrompt.options.filter((o) => !isPickerChromeOption(o.label)) as opt (opt.num)}
+						<button
+							type="button"
+							onclick={() => pickerKey(String(opt.num))}
+							disabled={sending}
+							class="min-h-[38px] px-3 py-2 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] hover:border-[var(--color-accent)]/60 text-left text-[var(--color-text)] disabled:opacity-50 active:scale-[0.99] transition flex items-start gap-3"
+						>
+							<span class="font-mono text-[var(--color-accent)] font-semibold min-w-6 shrink-0 mt-0.5">{opt.num}.</span>
+							<span class="flex-1 break-words">{stripTableChars(opt.label)}</span>
+						</button>
+					{/each}
+				</div>
+			{/if}
+			<div class="space-y-1.5">
+				<div class="text-[10px] uppercase tracking-wide text-[var(--color-text-dim)]">Điều hướng picker</div>
+				<div class="flex flex-wrap gap-1.5">
+					<button type="button" onclick={() => pickerKey('up')} disabled={sending} class="min-h-[38px] min-w-[42px] px-2.5 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-text)] font-mono text-[14px] disabled:opacity-50 active:scale-95 transition" aria-label="Up">↑</button>
+					<button type="button" onclick={() => pickerKey('down')} disabled={sending} class="min-h-[38px] min-w-[42px] px-2.5 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-text)] font-mono text-[14px] disabled:opacity-50 active:scale-95 transition" aria-label="Down">↓</button>
+					<button type="button" onclick={() => pickerKey('left')} disabled={sending} class="min-h-[38px] min-w-[42px] px-2.5 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-text)] font-mono text-[14px] disabled:opacity-50 active:scale-95 transition" aria-label="Left">←</button>
+					<button type="button" onclick={() => pickerKey('right')} disabled={sending} class="min-h-[38px] min-w-[42px] px-2.5 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-text)] font-mono text-[14px] disabled:opacity-50 active:scale-95 transition" aria-label="Right">→</button>
+				</div>
+				<div class="flex flex-wrap gap-1.5">
+					<button type="button" onclick={() => pickerKey('space')} disabled={sending} class="min-h-[38px] px-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-text)] text-[12px] disabled:opacity-50 active:scale-95 transition">Space</button>
+					<button type="button" onclick={() => pickerKey('enter')} disabled={sending} class="min-h-[38px] px-3 rounded-lg bg-[var(--color-success)]/15 border border-[var(--color-success)]/50 text-[var(--color-text)] text-[12px] font-semibold disabled:opacity-50 active:scale-95 transition">↵ Enter</button>
+					<button type="button" onclick={() => pickerKey('esc')} disabled={sending} class="min-h-[38px] px-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-text)] text-[12px] disabled:opacity-50 active:scale-95 transition">⎋ Esc</button>
+					<button type="button" onclick={() => pickerKey('tab')} disabled={sending} class="min-h-[38px] px-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-text)] text-[12px] disabled:opacity-50 active:scale-95 transition">Tab</button>
+				</div>
 			</div>
+			{#if livePane.length}
+				<div class="rounded-md bg-[var(--color-bg)]/80 border border-[var(--color-border)]/50 px-2.5 py-1.5">
+					<div class="text-[10px] uppercase tracking-wide text-[var(--color-text-dim)] mb-0.5">Màn hình CC</div>
+					<pre class="font-mono text-[11px] leading-snug whitespace-pre-wrap break-words m-0 max-h-52 overflow-y-auto">{livePane.join('\n')}</pre>
+				</div>
+			{/if}
+			<button
+				type="button"
+				onclick={dismissPickerAndFocus}
+				disabled={sending}
+				class="min-h-[38px] w-full px-3 py-2 rounded-lg bg-[var(--color-warning)]/20 border border-[var(--color-warning)]/50 text-[var(--color-warning)] text-[13px] active:scale-[0.99] transition disabled:opacity-50"
+			>
+				Gõ trả lời tự do (Esc) ↓
+			</button>
+		</div>
 		{:else if livePrompt?.found && livePrompt.options.length > 0}
-			<!-- REAL menu, read live from CC's tmux pane (PromptEndpoint): exact
-			     numbers + labels for THIS prompt (Bash / Edit-allow-all / 2-opt /
-			     N-opt). Tap → /choice raw-digit. No static 1/2/3 guess. -->
+			<!-- REAL menu from CC's tmux pane (PromptEndpoint): permission prompt /
+			     plain numbered menu. Single-select: tap → /choice raw-digit
+			     (select+submit). NOT an AskUserQuestion (handled above). -->
 			<div class="flex flex-col gap-2 pt-1">
-				{#each livePrompt.options as opt (opt.num)}
+				{#each livePrompt.options.filter((o) => !isPickerChromeOption(o.label)) as opt (opt.num)}
 					<button
 						type="button"
 						onclick={() => sendChoice(opt.num)}
@@ -1943,17 +1947,15 @@
 				</div>
 			</div>
 		{:else if livePromptPending}
-			<!-- Live /prompt fetch in flight — withhold the generic fallback so
-			     it doesn't flash for ~1s then get swapped by the real menu. -->
+			<!-- Live /prompt fetch in flight — withhold the fallback so it doesn't
+			     flash for ~1s then get swapped by the real menu. -->
 			<div class="flex items-center gap-2 pt-1 text-[12.5px] text-[var(--color-text-dim)]" aria-live="polite">
 				<span class="w-3.5 h-3.5 rounded-full border-2 border-[var(--color-text-dim)]/40 border-t-[var(--color-accent)] animate-spin shrink-0"></span>
 				<span>Đang đọc menu CC…</span>
 			</div>
 		{:else if isPermissionPrompt}
-			<!-- SAFE fallback: live menu not parsed yet (capture failed / not a
-			     numbered menu). Only the INVARIANTS — option 1 is "Yes" on every CC
-			     menu; Esc cancels on every CC menu. NEVER a static 2/3 (their
-			     meaning differs per prompt → wrong-option → interrupt). -->
+			<!-- SAFE fallback: live menu not parsed yet. Only the INVARIANT — option
+			     1 is "Yes" on every CC permission menu; Esc cancels. -->
 			<div class="flex flex-col gap-2 pt-1">
 				<button
 					type="button"
@@ -1972,12 +1974,11 @@
 					Từ chối / trả lời khác (Esc) ↓
 				</button>
 				<div class="text-[11px] text-[var(--color-text-dim)]/80 pt-0.5 leading-snug">
-					Chưa đọc được menu thật → chỉ 1=Yes (bất biến) + Esc. Đợi 1–2 giây rồi mở lại nếu cần lựa chọn khác.
+					Chưa đọc được menu thật → chỉ 1=Yes (bất biến) + Esc.
 				</div>
 			</div>
 		{:else if promptInfo && promptInfo.options.length > 0 && !promptInfo.isPicker}
-			<!-- CC explicit numbered options (e.g. permission prompts). Tap sends the digit;
-			     button label shows what that digit means. Plus an "Other" escape to composer. -->
+			<!-- CC explicit numbered options (permission prompts). Tap sends the digit. -->
 			<div class="flex flex-col gap-2 pt-1">
 				{#each promptInfo.options as opt (opt.num)}
 					<button
@@ -1997,36 +1998,9 @@
 				>
 					Khác — gõ trả lời tự do ↓
 				</button>
-				<div class="text-[11px] text-[var(--color-text-dim)]/80 pt-0.5 leading-snug">
-					Tap gửi đúng digit (1/2/…), không gửi text. CC chỉ nhận digit cho prompt loại này.
-				</div>
-			</div>
-		{:else if promptInfo && promptInfo.options.length > 0 && promptInfo.isPicker}
-			<!-- Multi-select / interactive picker: digit only toggles checkbox; Enter toggles too,
-			     doesn't submit. PWA can't drive this from one tap. Render read-only + Other. -->
-			<div class="flex flex-col gap-1 pt-1">
-				{#each promptInfo.options as opt (opt.num)}
-					<div
-						class="px-3 py-1.5 rounded-md bg-[var(--color-surface)]/50 border border-[var(--color-border)]/40 text-[var(--color-text-dim)] flex items-start gap-3 text-[13px]"
-					>
-						<span class="font-mono text-[var(--color-accent)]/70 font-semibold min-w-6">{opt.num}.</span>
-						<span class="flex-1 break-words">{stripTableChars(opt.label)}</span>
-					</div>
-				{/each}
-				<button
-					type="button"
-					onclick={focusComposer}
-					class="mt-2 min-h-[38px] px-3 py-2 rounded-lg border border-dashed border-[var(--color-border)] text-[var(--color-text-dim)] text-[13px] active:scale-[0.99] transition"
-				>
-					Trả lời tự do ↓
-				</button>
-				<div class="text-[11px] text-[var(--color-text-dim)]/80 pt-0.5 leading-snug">
-					Multi-select picker — Phase 1 chưa drive được từ PWA. Trả lời tự do bên dưới hoặc thao tác CC trên host.
-				</div>
 			</div>
 		{:else}
-			<!-- No structured options parsed (free-text question or assistant tool_use only).
-			     Don't guess Yes/No — just guide user to composer. -->
+			<!-- No structured options parsed (free-text question). Guide to composer. -->
 			<button
 				type="button"
 				onclick={focusComposer}

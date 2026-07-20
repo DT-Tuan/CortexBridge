@@ -19,6 +19,97 @@ public static class ReplyEndpoints
         app.MapPost("/api/sessions/{projectId}/choice/{digit}", PostChoice);
         app.MapPost("/api/sessions/{projectId}/quick-reply/{action}", PostQuickReply);
         app.MapPost("/api/sessions/{projectId}/cancel-picker", PostCancelPicker);
+        app.MapPost("/api/sessions/{projectId}/key/{key}", PostKey);
+    }
+
+    // Friendly key token (from the PWA "raw TUI remote" keypad) → tmux key name.
+    // Digits are handled separately (SendMenuChoiceAsync). This is the WHOLE
+    // vocabulary the remote can send — nothing else reaches send-keys through
+    // this path, so a picker can be driven exactly as at the keyboard with no
+    // answer composition / pane-scrape guessing (ADR-026 → the raw-remote
+    // redesign, 2026-07-18: the scrape+compose card kept mis-submitting and
+    // injecting garbage into replies; direct key pass-through removes the
+    // inference entirely).
+    private static readonly Dictionary<string, string> KeyMap =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["up"] = "Up", ["down"] = "Down", ["left"] = "Left", ["right"] = "Right",
+            ["enter"] = "Enter", ["esc"] = "Escape", ["escape"] = "Escape",
+            ["tab"] = "Tab", ["btab"] = "BTab", ["space"] = "Space",
+            ["bspace"] = "BSpace", ["home"] = "Home", ["end"] = "End",
+            ["pageup"] = "PageUp", ["pagedown"] = "PageDown",
+        };
+
+    /// <summary>
+    /// Send ONE raw key to the session's tmux pane — the single primitive behind
+    /// the PWA's "raw TUI remote" keypad for interactive pickers (permission
+    /// prompt / AskUserQuestion). <paramref name="key"/> is a friendly token:
+    /// a digit 1-9 (menu accelerator, via SendMenuChoiceAsync) or a named key
+    /// in <see cref="KeyMap"/> (arrows / enter / esc / tab / space / …). The
+    /// keypad mirrors what a person would press at the keyboard, so there is NO
+    /// answer composition and NO submit-key guessing — the user drives CC's real
+    /// TUI and watches the live pane preview react.
+    ///
+    /// Deliberately does NOT mutate needsInput/Processing: a single key may be a
+    /// mid-picker toggle or navigation, not an answer. The picker's real state
+    /// flows back through the existing pane-preview SSE + /prompt poll; when the
+    /// user actually submits/cancels, the pane stops being Blocked and the
+    /// watchdog/poll clears needsInput. This removes every optimistic-state race
+    /// that made the old card dismiss-then-reappear.
+    /// </summary>
+    private static async Task<IResult> PostKey(
+        string projectId,
+        string key,
+        HttpContext ctx,
+        TmuxClient tmux,
+        ProjectReplyMutex mutex,
+        TokenRateLimiter limiter,
+        SessionScanner scanner,
+        BridgeDbContext db,
+        CancellationToken ct)
+    {
+        var isDigit = key.Length == 1 && key[0] is >= '1' and <= '9';
+        if (!isDigit && !KeyMap.ContainsKey(key))
+            return ResultsHelpers.Error(400, "key.unknown",
+                "key must be a digit 1-9 or one of: "
+                + string.Join(", ", KeyMap.Keys));
+
+        var bearer = ctx.GetAuthToken();
+        if (bearer is not null && !limiter.TryAcquire(bearer.Id))
+            return ResultsHelpers.Error(429, "rate_limit.exceeded",
+                "Too many keys — limit is 30 per minute per token");
+
+        if (!await tmux.WindowExistsAsync(projectId, ct))
+            return ResultsHelpers.Error(404, "tmux.window_missing",
+                $"No tmux window named '{projectId}'");
+
+        // ADR-016 Slice 2: optional ?session= must match the live-slot UID so a
+        // key can never land on the wrong session.
+        var (sErr, active) = await CheckSessionAsync(ctx, scanner, projectId, ct);
+        if (sErr is not null) return sErr;
+
+        using var lk = mutex.TryAcquire(projectId);
+        if (lk is null)
+            return ResultsHelpers.Error(409, "reply.in_flight",
+                "Another reply is already being delivered for this project");
+
+        try
+        {
+            if (isDigit) await tmux.SendMenuChoiceAsync(projectId, key, ct);
+            else await tmux.SendKeyAsync(projectId, KeyMap[key], ct);
+        }
+        catch (TmuxException ex)
+        {
+            await AuditAsync(db, bearer, projectId, active?.SessionUuid, "key", null, "error", ex.Message, ct);
+            return ResultsHelpers.Error(500, "tmux.send_failed", "tmux invocation failed");
+        }
+
+        // Key name is safe to log (no transcript content). Lets the audit trail
+        // reconstruct a remote-driven picker session.
+        await AuditAsync(db, bearer, projectId, active?.SessionUuid, "key", null, "ok",
+            isDigit ? "digit:" + key : KeyMap[key], ct);
+        return Results.Json(new { acceptedAt = DateTimeOffset.UtcNow.ToString("o") },
+            Json.Default, statusCode: 202);
     }
 
     /// <summary>

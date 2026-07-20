@@ -92,6 +92,31 @@ public class SessionScanner
                 ?? FallbackProjectId(dir);
             var ownershipUuid = ownerMap.GetValueOrDefault(projectId);
 
+            // Tier 0: the pinned slot occupant exists but has NO file yet. CC creates
+            // a session (and fires the SessionStart that pins it here) minutes before
+            // it writes the first JSONL byte, so between a /clear and the next prompt
+            // the live session is real but fileless. Every tier below is file-derived
+            // and would hand back the dead pre-/clear session for that whole window —
+            // the "PWA stays on the old transcript until I send a message" bug.
+            // Gated on a live tmux window so a marker whose session never materialises
+            // (CC crashed, no exit hook) decays back to normal resolution instead of
+            // wedging the project on an empty transcript. Only reachable in that rare
+            // window, so the extra tmux call is not on the hot path.
+            if (!string.IsNullOrEmpty(ownershipUuid))
+            {
+                var pinnedPath = Path.Combine(dir, ownershipUuid + ".jsonl");
+                if (!File.Exists(pinnedPath) && await _tmux.WindowExistsAsync(projectId, ct))
+                {
+                    result.Add(new ActiveSession(
+                        ProjectId: projectId,
+                        SessionUuid: ownershipUuid,
+                        JsonlPath: pinnedPath,   // readers treat a missing file as empty
+                        LastModified: DateTimeOffset.UtcNow,
+                        EncodedCwdDir: dir));
+                    continue;
+                }
+            }
+
             // Tier 1 (hot path): a tracked slot occupant whose file exists wins
             // outright — NO record reads (PickLiveSession rule 1).
             var uuidOnly = jsonlFiles

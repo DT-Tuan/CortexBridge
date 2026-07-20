@@ -71,10 +71,107 @@ public class PaneClassifierTests
     [InlineData("Tab to amend")]
     [InlineData("Enter to select")]
     [InlineData("Esc to cancel")]
-    [InlineData("Do you want to create the file?")]
-    [InlineData("  > 2) Some option here")]
+    [InlineData("  › 2) Some option here")]
     public void BlockedMarkers_AreCovered(string marker)
         => Assert.Equal(PaneClassifier.PaneState.Blocked, PaneClassifier.Classify(marker));
+
+    [Fact]
+    public void DialogHeading_WithPlainNumberedOptions_IsBlocked()
+    {
+        // Folder-trust style dialog whose options render without the cursor
+        // glyph on the visible frame — the heading + option-line pair is the
+        // structural evidence.
+        var pane = """
+            Do you want to create the file?
+
+              1. Yes
+              2. No
+            """;
+        Assert.Equal(PaneClassifier.PaneState.Blocked, PaneClassifier.Classify(pane));
+    }
+
+    // ---- Structural hardening (live failure 2026-07-18): a session whose
+    // transcript merely DISPLAYS menu-ish text re-armed needsInput every
+    // watchdog sweep, re-asking an already-answered AskUserQuestion in the
+    // PWA. Ordinary content must never classify Blocked. ----
+
+    [Fact]
+    public void MarkdownQuoteNumberedItem_IsIdle()
+    {
+        // "> 1. …" is a markdown blockquote, not a menu cursor — plain ">"
+        // is deliberately not accepted as a cursor glyph any more.
+        Assert.Equal(PaneClassifier.PaneState.Idle,
+            PaneClassifier.Classify("> 1. Có nên tách module này không?\n> 2. Hay giữ nguyên?"));
+    }
+
+    [Fact]
+    public void HintWordsInsideLongCodeLine_IsIdle()
+    {
+        // A session printing THIS classifier's own source (code review, docs)
+        // shows the phrases inside long code lines — never a real footer hint.
+        var pane =
+            "        @\"esc to cancel|enter to select|tab to amend|ready to submit your answers\"\n"
+            + "        + @\"|do you want to (?:proceed|allow|create|run|make)\",";
+        Assert.Equal(PaneClassifier.PaneState.Idle, PaneClassifier.Classify(pane));
+    }
+
+    [Fact]
+    public void DialogHeadingInProse_WithoutOptions_IsIdle()
+    {
+        // A report SAYING "Do you want to proceed" with no option lines below.
+        var pane = "Tóm lại: khi CC hỏi Do you want to proceed thì bridge sẽ push về PWA.\n"
+            + "Chi tiết xem mục 3 phía trên.";
+        Assert.Equal(PaneClassifier.PaneState.Idle, PaneClassifier.Classify(pane));
+    }
+
+    [Fact]
+    public void NumberedReportWithToolOutputBars_IdleComposer_IsIdle()
+    {
+        // The exact 2026-07-18 shape: grok-agent tool output prints its own
+        // 60-char '─' bars (spoof dividers) and the assistant's report is a
+        // numbered list; the real composer + idle footer sit at the bottom.
+        var bar = new string('─', 60);
+        var pane =
+            bar + "\n"
+            + "grok-agent · model grok-4.5-build · turns 3 · stop EndTurn · 38s\n"
+            + bar + "\n"
+            + "Kết quả:\n"
+            + "1. Cài đặt xong wrapper\n"
+            + "2. Hook routing đã đăng ký\n"
+            + "3. Smoke-test PASS\n"
+            + Div + "\n"
+            + "❯ \n"
+            + Div + "\n"
+            + "  ? for shortcuts";
+        Assert.Equal(PaneClassifier.PaneState.Idle, PaneClassifier.Classify(pane));
+        Assert.True(PaneClassifier.IsConfidentIdle(pane));
+    }
+
+    [Fact]
+    public void SpoofDividerAsLastDivider_NumberedProseBelow_IsIdle()
+    {
+        // Worst case: a tool-output bar IS the last divider in view, so the
+        // "live region" is transcript prose with numbered lines and hint words
+        // inside a long sentence. Still must not classify Blocked.
+        var bar = new string('─', 60);
+        var pane =
+            "● Bash(grok-agent -q ...)\n"
+            + bar + "\n"
+            + "1. Finder góc A đã chạy xong và trả về 3 candidate cần verify thêm\n"
+            + "2. Nhớ kiểm tra lại vì grok in preamble lẫn trước JSON, esc to cancel không liên quan gì ở đây\n";
+        Assert.Equal(PaneClassifier.PaneState.Idle, PaneClassifier.Classify(pane));
+    }
+
+    [Fact]
+    public void BlockedMarker_ReportsStructuralReason()
+    {
+        Assert.Equal("cursor-option", PaneClassifier.BlockedMarker("❯ 1. Yes\n  2. No"));
+        Assert.Equal("hint:esc to cancel", PaneClassifier.BlockedMarker("  Esc to cancel"));
+        Assert.Equal("dialog+options",
+            PaneClassifier.BlockedMarker("Do you want to proceed?\n\n  1. Yes\n  2. No"));
+        Assert.Null(PaneClassifier.BlockedMarker("> 1. markdown quote"));
+        Assert.Null(PaneClassifier.BlockedMarker("✶ Working… (esc to interrupt)"));
+    }
 
     // ---- Idle: clean prompt or unrecognised → genuine dead latch ----
 

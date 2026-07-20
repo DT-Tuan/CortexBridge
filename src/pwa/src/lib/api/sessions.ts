@@ -97,6 +97,10 @@ export const sessionsApi = {
 			askAnswered?: number;
 			askQuestions?: { index: number; question: string | null; multi?: boolean; options: { num: number; label: string }[] }[];
 			askContext?: string | null;
+			// VISIBLE menu is multiSelect (checkbox options): a digit only
+			// TOGGLES; the raw-remote keypad drives it natively (no client-side
+			// special-casing needed).
+			multi?: boolean;
 		}>(`/api/sessions/${encodeURIComponent(projectId)}/prompt`),
 	restart: (projectId: string) =>
 		api.post<{ acceptedAt: string; window: string; resumed: boolean; sessionUuid: string | null }>(
@@ -144,6 +148,17 @@ export const sessionsApi = {
 		api.post<{ acceptedAt: string }>(
 			withSession(
 				`/api/sessions/${encodeURIComponent(projectId)}/cancel-picker`,
+				sessionUuid
+			)
+		),
+	// Raw TUI remote: send ONE key to the session's tmux pane. The single
+	// primitive behind the picker keypad (digits 1-9, arrows, space, enter,
+	// esc, tab). No answer composition — the user drives CC's real picker
+	// and watches the live pane preview react (ADR-026 raw-remote redesign).
+	key: (projectId: string, key: string, sessionUuid?: string) =>
+		api.post<{ acceptedAt: string }>(
+			withSession(
+				`/api/sessions/${encodeURIComponent(projectId)}/key/${encodeURIComponent(key)}`,
 				sessionUuid
 			)
 		),

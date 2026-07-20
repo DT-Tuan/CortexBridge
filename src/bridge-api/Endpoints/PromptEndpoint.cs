@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using CortexBridge.Api.Common;
+using CortexBridge.Api.Sessions;
 using CortexBridge.Api.Tmux;
 
 namespace CortexBridge.Api.Endpoints;
@@ -43,7 +44,14 @@ public static class PromptEndpoint
         // answered — so during the live window the pane is the ONLY source of
         // the context the questions refer to. Best-effort; null when not an
         // AskUserQuestion or no prose could be recovered.
-        string? AskContext = null);
+        string? AskContext = null,
+        // The VISIBLE menu is a multiSelect picker (checkbox glyphs on its
+        // option lines). On such a picker a digit keystroke only TOGGLES the
+        // option — the client must confirm via /picker-submit (Enter), never
+        // treat a digit as select-and-submit. Covers the single-question
+        // multiSelect AskUserQuestion, which renders NO tab bar and therefore
+        // reports IsAsk=false (live failure 2026-07-18).
+        bool Multi = false);
 
     // Optional cursor glyph (❯ > › » ‣ • * -), then "N." or "N)" then the label.
     private static readonly Regex OptionRe =
@@ -151,16 +159,58 @@ public static class PromptEndpoint
         _askCache = new();
     private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(90);
 
-    private static (bool isAsk, List<string> sections, int answered) ParseAskTabs(string[] lines)
+    // Gate B2: Submit must be its OWN tab segment (glyph + optional spaces + word).
+    private static readonly Regex AskSubmitTabRe = new(
+        @"(?:[☐☑☒✓✔◯●]|\[[ xX]\])\s*Submit\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // After the Submit token only tab-bar decoration may remain (no prose).
+    private static readonly Regex AskSubmitTrailRe = new(
+        @"^[\s→»│─—\-]*$", RegexOptions.Compiled);
+    private const int LiveRegionTail = 20; // bottom-of-pane window when no divider
+
+    /// <summary>
+    /// Detect a real AskUserQuestion tab bar in a pane capture. Gate B1 scopes
+    /// to the live region (after last divider, else last 20 lines); Gate B2
+    /// requires Submit as its own segment with no prose after it. Pure + static
+    /// for unit testing.
+    /// </summary>
+    public static (bool isAsk, List<string> sections, int answered) ParseAskTabs(string[] lines)
     {
-        foreach (var raw in lines)
+        // Gate B1: live-region scoping — real tab bar sits at the bottom of the
+        // pane (inside the input box), never up in scrollback.
+        var lastDiv = -1;
+        for (var i = lines.Length - 1; i >= 0; i--)
+            if (CtxDividerRe.IsMatch(lines[i])) { lastDiv = i; break; }
+
+        if (lastDiv >= 0)
         {
-            var line = raw;
+            var hit = TryParseAskTabsInRange(lines, lastDiv, lines.Length);
+            if (hit.isAsk) return hit;
+            // Divider present but no bar under it — fall back to last N lines.
+        }
+
+        var start = Math.Max(0, lines.Length - LiveRegionTail);
+        return TryParseAskTabsInRange(lines, start, lines.Length);
+    }
+
+    private static (bool isAsk, List<string> sections, int answered) TryParseAskTabsInRange(
+        string[] lines, int start, int end)
+    {
+        for (var i = start; i < end; i++)
+        {
+            var line = lines[i];
             if (line.IndexOf("Submit", StringComparison.OrdinalIgnoreCase) < 0) continue;
             if (!line.Contains('☐') && !line.Contains('☑') && !line.Contains('☒') && !line.Contains('✔')
                 && !line.Contains('✓') && !line.Contains('●') && !line.Contains('◯')
                 && !line.Contains("[ ]") && !line.Contains("[x]") && !line.Contains("[X]"))
                 continue;
+
+            // Gate B2: Submit is its own tab segment AND nothing but decoration
+            // follows (rejects "✔ Submit, or this very code review").
+            var sm = AskSubmitTabRe.Match(line);
+            if (!sm.Success) continue;
+            var after = line[(sm.Index + sm.Length)..];
+            if (!AskSubmitTrailRe.IsMatch(after)) continue;
 
             var sections = new List<string>();
             var answered = 0;
@@ -183,11 +233,26 @@ public static class PromptEndpoint
     /// Parse the currently-visible menu from a pane capture: the active
     /// numbered-option block (last block starting at "1."), the question line
     /// above it, and — for AskUserQuestion — the "(K)" current tab index.
+    ///
+    /// <para>Scoped to <see cref="PaneClassifier.LiveRegion"/>, NOT the whole
+    /// pane. Live failure 2026-07-20: a session running a <c>for</c> loop
+    /// printed numbered lines into the transcript; this parser scanned the
+    /// entire capture, adopted them as the option block, and the PWA rendered a
+    /// phantom picker. Tapping an option sent a digit to a session with no menu
+    /// open, so nothing happened and the card only went away on cancel.</para>
+    ///
+    /// <para><see cref="ParseAskTabs"/> was given live-region scoping by
+    /// ADR-026; this sibling parser was not, and reusing
+    /// <c>PaneClassifier.LiveRegion</c> here keeps ONE definition of "live"
+    /// across the watchdog, the classifier and this endpoint rather than a
+    /// third private copy that can drift.</para>
+    ///
+    /// <para>Public for unit testing — it is pure.</para>
     /// </summary>
-    private static (string? question, List<PromptOption> options, int? askK, bool multi) ParseVisible(string pane)
+    public static (string? question, List<PromptOption> options, int? askK, bool multi) ParseVisible(string pane)
     {
         var multi = false;
-        var lines = pane.Replace("\r", "").Split('\n');
+        var lines = PaneClassifier.LiveRegion(pane).Replace("\r", "").Split('\n');
 
         var hits = new List<(int idx, int num, string label)>();
         for (var i = 0; i < lines.Length; i++)
@@ -261,8 +326,18 @@ public static class PromptEndpoint
         try { pane = await tmux.CapturePaneAsync(projectId, ct); }
         catch (TmuxException) { return Results.Json(none, Json.Default); }
 
+        // A running turn has no prompt to answer. CC replaces the
+        // "esc to interrupt" footer while a menu is open, so Working and an
+        // open menu never co-occur in the live region (see PaneClassifier).
+        // Without this gate, tool output that merely LOOKS like a menu — a
+        // `for` loop printing numbered lines, live 2026-07-20 — surfaces a
+        // phantom card whose taps go nowhere, because the digit lands in a
+        // session that has no menu open.
+        if (PaneClassifier.Classify(pane) == PaneClassifier.PaneState.Working)
+            return Results.Json(none, Json.Default);
+
         var lines = pane.Replace("\r", "").Split('\n');
-        var (question, opts, _, _) = ParseVisible(pane);
+        var (question, opts, _, visibleMulti) = ParseVisible(pane);
         var canEsc = Regex.IsMatch(pane, "esc to cancel", RegexOptions.IgnoreCase)
             || opts.Exists(o => o.Label.Contains("(esc)", StringComparison.OrdinalIgnoreCase));
         var (isAsk, sections, answered) = ParseAskTabs(lines);
@@ -314,7 +389,8 @@ public static class PromptEndpoint
                 AskSections: isAsk ? sections : null,
                 AskAnswered: answered,
                 AskQuestions: askQuestions,
-                AskContext: askContext),
+                AskContext: askContext,
+                Multi: visibleMulti),
             Json.Default);
     }
 

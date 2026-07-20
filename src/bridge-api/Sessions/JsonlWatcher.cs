@@ -144,6 +144,15 @@ public class JsonlWatcher : IAsyncDisposable
             catch { _offset = 0; }
         }
 
+        // The resolved session can be pinned-but-fileless (SessionScanner Tier 0:
+        // post-/clear, before CC's first write). Nothing to tail until it appears —
+        // the FileSystemWatcher on the dir wakes us when it does.
+        if (!File.Exists(_currentJsonlPath))
+        {
+            _offset = 0;
+            return;
+        }
+
         var fileLen = new FileInfo(_currentJsonlPath!).Length;
         if (fileLen < _offset)
         {

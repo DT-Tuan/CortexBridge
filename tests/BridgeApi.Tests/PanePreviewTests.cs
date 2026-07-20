@@ -86,4 +86,58 @@ public class PanePreviewTests
         var tail = PanePreview.Tail(pane);
         Assert.Equal("● Doing the thing", tail.Single());
     }
+
+    // ---- PickerView: the OPPOSITE of Tail — it must KEEP the picker chrome
+    // (cursor/checkbox/tab-bar/footer) that Tail strips, so the PWA raw-TUI
+    // remote can show CC's real picker as the user drives it (2026-07-18). ----
+
+    private static readonly string PickerPane =
+        "● Finished the analysis.\n"
+        + "  ⎿  4 skills available\n"
+        + Div + "\n"
+        + "←  ☒ Test  ✔ Submit  →\n\n"
+        + "Chọn các mục test?\n\n"
+        + "❯ 1. [✔] Alpha\n"
+        + "  2. [ ] Beta\n"
+        + "  3. [ ] Gamma\n"
+        + Div + "\n"
+        + "Enter to select · ↑/↓ to navigate · Esc to cancel";
+
+    [Fact]
+    public void PickerView_KeepsCursorCheckboxAndTabBar()
+    {
+        var view = string.Join("\n", PanePreview.PickerView(PickerPane));
+        Assert.Contains("❯ 1. [✔] Alpha", view);   // cursor + checked box
+        Assert.Contains("2. [ ] Beta", view);       // unchecked box
+        Assert.Contains("☒ Test  ✔ Submit", view);  // tab bar
+        Assert.Contains("Enter to select", view);   // footer hint
+    }
+
+    [Fact]
+    public void PickerView_TailWouldHaveStrippedThePicker()
+    {
+        // Guard the reason PickerView exists: Tail cuts at the bottom box's top
+        // divider, so the picker options/tab/footer are GONE from Tail's output.
+        var tail = string.Join("\n", PanePreview.Tail(PickerPane));
+        Assert.DoesNotContain("[✔] Alpha", tail);
+        Assert.DoesNotContain("Enter to select", tail);
+    }
+
+    [Fact]
+    public void PickerView_DropsBlankPaddingAndCaps()
+    {
+        var view = PanePreview.PickerView("a\n\n   \nb\n\n\nc");
+        Assert.Equal(new[] { "a", "b", "c" }, view);
+        // maxLines bound honoured (tail-most kept).
+        var many = string.Join("\n", System.Linq.Enumerable.Range(1, 40).Select(i => "line" + i));
+        Assert.Equal(24, PanePreview.PickerView(many).Length);
+        Assert.Equal("line40", PanePreview.PickerView(many)[^1]);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   \n  ")]
+    public void PickerView_EmptyOnBlank(string? pane)
+        => Assert.Empty(PanePreview.PickerView(pane));
 }
