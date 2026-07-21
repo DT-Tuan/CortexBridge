@@ -22,6 +22,9 @@ export type AutoAllowState = {
 	autonomy: boolean; // TRUST tier: build/test + local git (.autonomy)
 	push: boolean; // sub-flag: allow git push (.push)
 	install: boolean; // sub-flag: allow package installs (.install)
+	roOff: boolean; // ADR-028 A: opt-out of default-on read-only in workspace (.ro-off)
+	burstUntil: number; // ADR-028 B: burst expiry epoch (seconds); 0 if none/expired
+	burstOpaque: boolean; // ADR-028 B: burst also allows opaque cmds (ssh/python) past the backstop
 };
 
 // ADR-016 Slice 2: append `?session=<uuid>` when the caller is explicitly
@@ -208,6 +211,12 @@ export const sessionsApi = {
 		api.post<AutoAllowState>(
 			`/api/sessions/${encodeURIComponent(projectId)}/autoallow`,
 			patch
+		),
+	// ADR-028 B: start (minutes>0) or cancel (minutes<=0) a time-boxed autonomy burst.
+	setBurst: (projectId: string, minutes: number, opaque: boolean) =>
+		api.post<AutoAllowState>(
+			`/api/sessions/${encodeURIComponent(projectId)}/autoallow/burst`,
+			{ minutes, opaque }
 		),
 	// Record a user-approved tool call so the host hook can auto-allow it next
 	// time without a prompt. Fire-and-forget from the caller's perspective —

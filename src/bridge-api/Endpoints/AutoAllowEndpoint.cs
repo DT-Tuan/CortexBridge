@@ -19,6 +19,9 @@ namespace CortexBridge.Api.Endpoints;
 ///   autonomy  — TRUST: also build/test/lint/format + local git (add/commit/stash)
 ///   push      — sub of autonomy: also `git push` (never --force)
 ///   install   — sub of autonomy: also package installs
+///   ro-off    — opt a workspace project OUT of default-on read-only (ADR-028 A):
+///               the hook turns the read tier ON by default under ~/workspace, and
+///               this flag is the per-project opt-out the PWA shield writes.
 ///
 /// The claude-config docker volume binds to host ~/.claude, so a flag the bridge
 /// writes here is read live by the host hook on the next tool call.
@@ -30,6 +33,7 @@ public static class AutoAllowEndpoint
         app.MapGet("/api/sessions/{projectId}/autoallow", GetHandler);
         app.MapPost("/api/sessions/{projectId}/autoallow", SetHandler);
         app.MapPost("/api/sessions/{projectId}/autoallow/learn", LearnHandler);
+        app.MapPost("/api/sessions/{projectId}/autoallow/burst", BurstHandler);
     }
 
     private static IResult GetHandler(string projectId, BridgePaths paths)
@@ -95,6 +99,34 @@ public static class AutoAllowEndpoint
 
         return Results.Json(state, Json.Default);
     }
+
+    private static async Task<IResult> BurstHandler(
+        string projectId,
+        AutoAllowFlags.BurstRequest body,
+        HttpContext ctx,
+        BridgePaths paths,
+        BridgeDbContext db,
+        CancellationToken ct)
+    {
+        if (!AutoAllowFlags.TryFlagDir(paths.ClaudeUserDir, projectId, out var dir))
+            return ResultsHelpers.Error(400, "autoallow.bad_project_id", "Invalid projectId");
+
+        var (until, opaque) = AutoAllowFlags.SetBurst(dir, projectId, body.Minutes, body.Opaque);
+
+        db.AuditLogs.Add(new AuditLog
+        {
+            Timestamp = DateTimeOffset.UtcNow,
+            ProjectId = projectId,
+            Action = "session.autoallow.burst",
+            TokenId = ctx.GetAuthToken()?.Id,
+            Result = "ok",
+            // tier/time only, never command content
+            Detail = until > 0 ? $"until={until}{(opaque ? " opaque" : string.Empty)}" : "cancelled",
+        });
+        await db.SaveChangesAsync(ct);
+
+        return Results.Json(AutoAllowFlags.Read(dir, projectId), Json.Default);
+    }
 }
 
 /// <summary>
@@ -114,10 +146,13 @@ public static class AutoAllowFlags
         (".autonomy", r => r.Autonomy),
         (".push",     r => r.Push),
         (".install",  r => r.Install),
+        (".ro-off",   r => r.RoOff),   // ADR-028 A: opt-out of default-on read-only
     };
 
-    public record State(bool Enabled, bool Autonomy, bool Push, bool Install);
-    public record SetRequest(bool? Enabled, bool? Autonomy, bool? Push, bool? Install);
+    public record State(bool Enabled, bool Autonomy, bool Push, bool Install, bool RoOff,
+        long BurstUntil, bool BurstOpaque);
+    public record SetRequest(bool? Enabled, bool? Autonomy, bool? Push, bool? Install, bool? RoOff);
+    public record BurstRequest(int Minutes, bool Opaque);
 
     /// <summary>
     /// Resolve + validate the flag directory for a project, rejecting any
@@ -144,11 +179,63 @@ public static class AutoAllowFlags
         return true;
     }
 
-    public static State Read(string flagDir, string projectId) => new(
-        Enabled: File.Exists(Path.Combine(flagDir, projectId + ".on")),
-        Autonomy: File.Exists(Path.Combine(flagDir, projectId + ".autonomy")),
-        Push: File.Exists(Path.Combine(flagDir, projectId + ".push")),
-        Install: File.Exists(Path.Combine(flagDir, projectId + ".install")));
+    public static State Read(string flagDir, string projectId)
+    {
+        var burstUntil = ReadBurst(flagDir, projectId, out var burstOpaque);
+        return new(
+            Enabled: File.Exists(Path.Combine(flagDir, projectId + ".on")),
+            Autonomy: File.Exists(Path.Combine(flagDir, projectId + ".autonomy")),
+            Push: File.Exists(Path.Combine(flagDir, projectId + ".push")),
+            Install: File.Exists(Path.Combine(flagDir, projectId + ".install")),
+            RoOff: File.Exists(Path.Combine(flagDir, projectId + ".ro-off")),
+            BurstUntil: burstUntil,
+            BurstOpaque: burstOpaque);
+    }
+
+    /// <summary>
+    /// ADR-028 B — read the time-boxed burst. Returns the expiry epoch (seconds) if a
+    /// .burst flag exists and is unexpired, else 0 (and deletes an expired file). Hook
+    /// format is "&lt;epoch&gt; [opaque]" on the first line.
+    /// </summary>
+    public static long ReadBurst(string flagDir, string projectId, out bool opaque)
+    {
+        opaque = false;
+        var path = Path.Combine(flagDir, projectId + ".burst");
+        if (!File.Exists(path)) return 0;
+        try
+        {
+            var first = File.ReadAllText(path).Split('\n', 2)[0].TrimEnd('\r');
+            var parts = first.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0 || !long.TryParse(parts[0], out var exp)) return 0;
+            if (exp <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+            {
+                try { File.Delete(path); } catch { /* best-effort cleanup */ }
+                return 0;
+            }
+            opaque = parts.Length > 1 && parts[1] == "opaque";
+            return exp;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>
+    /// ADR-028 B — start (minutes &gt; 0, clamped to 8h) or cancel (minutes &lt;= 0) a
+    /// burst, writing the hook's "&lt;epoch&gt; [opaque]" format. Returns (until, opaque).
+    /// </summary>
+    public static (long Until, bool Opaque) SetBurst(string flagDir, string projectId, int minutes, bool opaque)
+    {
+        var path = Path.Combine(flagDir, projectId + ".burst");
+        if (minutes <= 0)
+        {
+            if (File.Exists(path)) File.Delete(path);
+            return (0, false);
+        }
+        Directory.CreateDirectory(flagDir);
+        minutes = Math.Min(minutes, 8 * 60);   // ceiling: a bad client can't grant an unbounded window
+        var exp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + minutes * 60L;
+        File.WriteAllText(path, opaque ? $"{exp} opaque\n" : $"{exp}\n");
+        return (exp, opaque);
+    }
 
     /// <summary>
     /// Apply a partial request (only non-null fields change). Returns the new
@@ -185,11 +272,13 @@ public static class AutoAllowFlags
 /// the PWA are persisted to {flagDir}/{projectId}.learned.json so the hook can
 /// auto-allow them on future calls without a prompt.
 ///
-/// Schema: { "bashCommands": ["exact cmd", ...], "tools": ["Read", ...] }
-///   bashCommands — exact Bash command strings (exact match in the hook)
-///   tools        — non-Bash tool names whose ANY call is auto-allowed
+/// Schema: { "bashCommands": [], "tools": ["Read", ...] }
+///   bashCommands — RETIRED (ADR-028 D): kept in the schema for back-compat but never
+///                  written or read. Exact-string Bash learning never re-matched and
+///                  captured plaintext secrets in a world-readable file.
+///   tools        — non-Bash tool names whose ANY call is auto-allowed (no command content)
 ///
-/// The hook reads this file after the tier-flag check; bridge owns writes.
+/// The hook reads .tools after the tier-flag check; bridge owns writes.
 /// </summary>
 public static class LearnedAutoAllow
 {
@@ -227,29 +316,26 @@ public static class LearnedAutoAllow
         // Interactive/meta tools are never learnable — see NeverLearnTools.
         if (NeverLearnTools.Contains(tool)) return;
 
+        // ADR-028 D: exact-string Bash learning is RETIRED. It never re-matched (≈98% of the
+        // historical store was write-once) and captured plaintext secrets (tokens, ssh key
+        // paths, .env greps) into a world-readable file. A (default-on reads) + B (autonomy/
+        // burst) cover the safe cases; the unsafe ones must keep prompting. Only tool-NAME
+        // learning survives (Read/Write/Edit — no command content, so no secret capture).
+        // `command` is intentionally ignored.
+        _ = command;
+        if (string.Equals(tool, "Bash", StringComparison.OrdinalIgnoreCase)) return;
+        if (string.IsNullOrEmpty(tool)) return;
+
         var path = FilePath(flagDir, projectId);
         lock (_lock)
         {
             Directory.CreateDirectory(flagDir);
             var data = Load(path);
-            var changed = false;
-
-            if (string.Equals(tool, "Bash", StringComparison.OrdinalIgnoreCase))
-            {
-                if (!string.IsNullOrEmpty(command) && !data.BashCommands.Contains(command))
-                {
-                    data.BashCommands.Add(command);
-                    changed = true;
-                }
-            }
-            else if (!string.IsNullOrEmpty(tool) && !data.Tools.Contains(tool))
+            if (!data.Tools.Contains(tool))
             {
                 data.Tools.Add(tool);
-                changed = true;
-            }
-
-            if (changed)
                 File.WriteAllText(path, JsonSerializer.Serialize(data, Json.Default));
+            }
         }
     }
 

@@ -66,3 +66,6 @@ bundle-stats/
 # Python (tooling under tools/)
 __pycache__/
 *.pyc
+
+# Machine-local build memory samples from tools/build-bridge.sh
+tools/.build-mem-history

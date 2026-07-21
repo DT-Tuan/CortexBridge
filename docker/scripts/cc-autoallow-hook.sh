@@ -32,10 +32,12 @@
 # NB: deliberately NO `set -e`.
 #
 # Compound-command safety note: we split on the shell operators && || ; | and require
-# EVERY segment to be independently allowed. We split even inside quotes (we do not
-# parse quoting) — this is intentionally fail-safe: a separator hidden in a quoted arg
-# makes the segment unparseable and the command falls through to a prompt, never to a
-# wrong allow. Redirection/substitution/subshell/backgrounding are rejected outright.
+# EVERY segment to be independently allowed. The split itself is quote-blind, but each
+# segment is then resolved to shell-faithful literal argv (resolve_tokens) BEFORE the
+# floor/allowlist see it, so quoting/escaping can't hide a dangerous token (e.g.
+# `git push "--force"`) from is_destructive. A separator hidden in a quoted arg leaves a
+# segment with an unterminated quote -> resolve_tokens fails -> prompt, never a wrong
+# allow. Redirection/substitution/subshell/backgrounding are rejected outright.
 
 PAYLOAD="$(cat 2>/dev/null || true)"
 CLAUDE_DIR="${CC_AUTOALLOW_CLAUDE_DIR:-$HOME/.claude}"
@@ -44,7 +46,8 @@ TOKEN_FILE="${BRIDGE_HOOK_TOKEN_FILE:-/opt/cortex/data/sqlite/bridge-hook-token}
 BRIDGE_URL="${BRIDGE_INTERNAL_URL:-http://127.0.0.1:3000}"
 
 # --- resolve project + gate on the per-project flags (cheapest checks first) ---
-PROJECT_ID="$(jq -r '.cwd // empty | split("/") | last' <<<"$PAYLOAD" 2>/dev/null)"
+CWD="$(jq -r '.cwd // empty' <<<"$PAYLOAD" 2>/dev/null)"
+PROJECT_ID="${CWD##*/}"
 [ -n "$PROJECT_ID" ] || exit 0
 
 RO_ON=0; AUTON=0; PUSH_OK=0; INSTALL_OK=0
@@ -53,8 +56,47 @@ RO_ON=0; AUTON=0; PUSH_OK=0; INSTALL_OK=0
 [ -f "$FLAG_DIR/$PROJECT_ID.push" ] && PUSH_OK=1
 [ -f "$FLAG_DIR/$PROJECT_ID.install" ] && INSTALL_OK=1
 [ "$AUTON" = 1 ] && RO_ON=1   # autonomy includes the read-only set
+
+# ADR-028 (A): the READ-ONLY tier is ON BY DEFAULT for projects under a workspace
+# root (where real dev happens) — so reads / read-only Bash stop prompting without a
+# per-project opt-in — UNLESS the user opted this project out with a .ro-off file.
+# Dirs OUTSIDE the workspace (e.g. ~/.ssh, /etc) stay gated. Only the read tier is
+# defaulted; autonomy/push/install stay explicit opt-in. Roots are colon-separated
+# (CC_AUTOALLOW_RO_ROOTS), default ~/workspace.
+if [ "$RO_ON" != 1 ] && [ ! -f "$FLAG_DIR/$PROJECT_ID.ro-off" ]; then
+  case "$CWD" in
+    ""|*..*) : ;;                    # empty or non-canonical path -> never default-on
+    *)
+      IFS=':' read -ra _RO_ROOTS <<<"${CC_AUTOALLOW_RO_ROOTS:-$HOME/workspace}"
+      for _r in "${_RO_ROOTS[@]}"; do
+        [ -n "$_r" ] || continue
+        if [ "$CWD" = "$_r" ] || [ "${CWD#"$_r"/}" != "$CWD" ]; then
+          RO_ON=1; break
+        fi
+      done
+      ;;
+  esac
+fi
+
+# ADR-028 (B): time-boxed autonomy BURST. A .burst flag's first line is an expiry epoch
+# (optional 2nd word "opaque"). While unexpired it grants autonomy + installs (Class Y),
+# auto-expiring; the Class-X floor + secret denylist still apply (classify_command is
+# unchanged). "opaque" additionally lets normally-unanalyzable commands (ssh bodies,
+# heredocs, $()) run — but only past the opaque_backstop RAW scan (see below).
+BURST=0; OPAQUE_OK=0
+if [ -f "$FLAG_DIR/$PROJECT_ID.burst" ]; then
+  read -r _bexp _bopq _brest < "$FLAG_DIR/$PROJECT_ID.burst" 2>/dev/null || true
+  case "$_bexp" in
+    ''|*[!0-9]*) : ;;                               # malformed expiry -> ignore (fail safe)
+    *) if [ "$_bexp" -gt "$(date +%s)" ]; then
+         BURST=1; RO_ON=1; AUTON=1; INSTALL_OK=1
+         [ "$_bopq" = "opaque" ] && OPAQUE_OK=1
+       fi ;;
+  esac
+fi
+
 LEARNED_FILE="$FLAG_DIR/$PROJECT_ID.learned.json"
-[ "$RO_ON" = 1 ] || [ -f "$LEARNED_FILE" ] || exit 0    # neither tier nor learned file -> never auto-allow
+[ "$RO_ON" = 1 ] || [ -f "$LEARNED_FILE" ] || [ "$BURST" = 1 ] || exit 0    # neither tier nor learned file nor burst -> never auto-allow
 
 TOOL="$(jq -r '.tool_name // empty' <<<"$PAYLOAD" 2>/dev/null)"
 [ -n "$TOOL" ] || exit 0
@@ -96,6 +138,8 @@ args_have_secret() {
       *.credentials.json|*/.aws/*|*.aws/credentials) return 0;;
       .env|*/.env|.env.*|*/.env.*) return 0;;
       */.gnupg/*|*/.password-store/*|*cortex-secrets*) return 0;;
+      */.kube/*|.kube/config|*/.docker/config.json|.docker/config.json) return 0;;
+      */.config/gcloud/*|.config/gcloud/*|*application_default_credentials*) return 0;;
     esac
   done
   return 1
@@ -121,6 +165,50 @@ is_destructive() {
   return 1
 }
 
+# True if the command contains an UNQUOTED brace `{`/`}` — bash brace-expansion concatenates
+# (r{m,m} -> "rm rm") and can hide a destructive token from a word scan, and unlike globs it
+# expands with no matching file. Quoted braces/globs (regex in an ssh body, awk '{print}') are
+# literal and safe, so they are NOT flagged. Mirrors has_unsafe_metachar's quote state machine.
+has_unquoted_brace() {
+  local s="$1"; local n=${#s} i=0 c st=N   # separate stmt: ${#s} needs s set first
+  while [ "$i" -lt "$n" ]; do
+    c="${s:$i:1}"
+    case "$st" in
+      N) case "$c" in \\) i=$((i+2)); continue;; \') st=S;; \") st=D;; '{'|'}') return 0;; esac;;
+      S) [ "$c" = "'" ] && st=N;;
+      D) case "$c" in \\) i=$((i+2)); continue;; \") st=N;; esac;;
+    esac
+    i=$((i+1))
+  done
+  return 1
+}
+
+# Opaque-ok backstop (ADR-028 B): during a burst with "opaque", commands the structured
+# floor can't analyze (ssh '<body>', $(...), heredocs, non-allowlisted programs) may run.
+# This RAW-string scan is then the ONLY floor left for them, so it is broad and fail-safe:
+# block if the command mentions a destructive program, an irreversible flag, a brace/glob
+# (bash could expand it into a hidden token), or a secret path — wherever it hides. It
+# over-blocks on purpose (any ` -f `, ` -D `, ` clean `, any { } * ? [ ): a false block
+# only costs a prompt, never a wrong allow.
+opaque_backstop() {   # $1 = raw command; 0 = safe to allow, 1 = block (prompt)
+  has_unquoted_brace "$1" && return 1   # unquoted brace-expansion can hide a token; quoted globs/regex are safe
+  local ch sec=" $1 " s
+  for ch in '"' "'" '`' '\'; do sec="${sec//"$ch"/}"; done                            # strip quotes/backslash: r''m -> rm, keep paths
+  s="$sec"
+  for ch in '$' '(' ')' ';' '|' '&' '<' '>' '=' ',' '/'; do s="${s//"$ch"/ }"; done   # + separators -> space (word view)
+  s="${s//$'\t'/ }"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"
+  case " $s " in
+    *" rm "*|*" rmdir "*|*" shred "*|*" dd "*|*" mkfs "*|*" mkfs."*|*" fdisk "*|*" sfdisk "*|*" wipefs "*) return 1;;
+    *" --no-preserve-root "*|*" --force "*|*" --force-with-lease "*|*" --hard "*) return 1;;
+  esac
+  case " $sec " in   # secret-path substrings (quotes stripped so ~/.ss''h -> ~/.ssh; separators/paths intact)
+    */.ssh/*|*id_rsa*|*id_ed25519*|*id_ecdsa*|*id_dsa*|*.pem*|*.key*|*.p12*|*.pfx*) return 1;;
+    *.credentials.json*|*/.aws/*|*.env*|*/.gnupg/*|*/.password-store/*|*cortex-secrets*) return 1;;
+    */.kube/*|*/.docker/config.json*|*/.config/gcloud/*|*application_default_credentials*) return 1;;
+  esac
+  return 0
+}
+
 # Build/test/lint/format runners (autonomy). These EXECUTE project code by design.
 is_build_cmd() {
   local prog="${1##*/}"
@@ -129,8 +217,8 @@ is_build_cmd() {
     npm|pnpm|yarn|bun)
       case "${2:-}" in
         test) return 0;;
-        run) case "${3:-}" in
-               build|test|lint|check|format|typecheck|type-check|size|coverage|ci|prepush*) return 0;;
+        run) case "${3:-}" in   # prefix-match so test:run / build:prod / lint:fix etc. count
+               build*|test*|lint*|check*|format*|typecheck*|type-check*|size*|coverage*|ci|prepush*) return 0;;
              esac;;
       esac;;
     dotnet) case "${2:-}" in build|test|format) return 0;; esac;;
@@ -170,6 +258,41 @@ is_ro_sort() {
     case "$t" in -o|-o?*|--output|--output=*) return 1;; esac
   done
   return 0
+}
+# sed is read-only ONLY in the narrow, unambiguous line-print form: read-safe flags
+# (-n/-E/-r/-z + long spellings) + a script that is a pure numeric-range print
+# (e.g. 60,110p / 5p / 10,$p / $p). Rejects -i/-e/-f (write/script-file/multi-expr) and
+# any regex/command script (which could carry w/W/e/r/R = write/execute). Allowlist of
+# safe forms, NOT a denylist of dangerous ones — so it cannot be tricked by an unlisted
+# sed command. `awk` stays fully excluded (system()/print >file are unvettable).
+is_ro_sed() {   # $@ = full argv incl "sed"; 0 = safe read-only line-print
+  local t seen=0
+  for t in "${@:2}"; do
+    case "$t" in
+      -n|-E|-r|-z|--quiet|--silent|--regexp-extended|--null-data) continue;;   # read-safe flags
+      -*) return 1;;                                                            # -i/-e/-f/anything else -> unsafe
+      *)
+        if [ "$seen" = 0 ]; then
+          seen=1
+          [[ "$t" =~ ^([0-9]+(,([0-9]+|\$))?|\$)p$ ]] || return 1               # only <range>p / $p
+        fi
+        ;;                                                                      # later positionals = files
+    esac
+  done
+  [ "$seen" = 1 ]
+}
+# Remove SAFE output redirects (N>/dev/null, N>>/dev/null, &>/dev/null, N>&M, N>&-) from
+# the command BEFORE the metachar gate + classification, so ubiquitous `2>/dev/null` /
+# `2>&1` stop forcing a prompt. Redirects to a REAL file (`> f`, `2> f`, `>> f`) do NOT
+# match these patterns, keep their `>`, and are still rejected by has_unsafe_metachar.
+# This only rewrites the CLASSIFICATION view; bash still runs the original (the redirect
+# just goes to /dev/null / an fd-dup, which is harmless), so program-level safety is
+# unchanged and is_destructive/args_have_secret still see the real program + paths.
+strip_safe_redirects() {
+  printf '%s' "$1" | sed -E \
+    -e 's@(^|[[:space:]])[0-9]*&?>>?[[:space:]]*/dev/null([[:space:];|&]|$)@\1 \2@g' \
+    -e 's@(^|[[:space:]])[0-9]*>&[0-9]+([[:space:];|&]|$)@\1 \2@g' \
+    -e 's@(^|[[:space:]])[0-9]*>&-([[:space:];|&]|$)@\1 \2@g'
 }
 
 # git config is read-only only when it carries a get/list flag (no value-set form).
@@ -213,7 +336,7 @@ classify_tokens() {
   [ "$#" -ge 1 ] || { SEGRES=1; SEGWHY="empty"; return; }
   local prog="${1##*/}"
 
-  if is_destructive "$@"; then SEGRES=0; SEGWHY="destructive"; return; fi
+  if is_destructive "$@"; then SEGRES=0; SEGWHY="destructive"; FLOOR_HIT=1; return; fi
   if [ "$prog" = "git" ]; then classify_git "$@"; return; fi
 
   if [ "$prog" = "env" ]; then
@@ -237,16 +360,20 @@ classify_tokens() {
   fi
 
   if [ "$RO_ON" = 1 ] && [ "$prog" = "find" ] && is_ro_find "$@"; then
-    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; return; fi
+    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; FLOOR_HIT=1; return; fi
     SEGRES=1; SEGWHY="read-only find"; return
   fi
   if [ "$RO_ON" = 1 ] && [ "$prog" = "sort" ] && is_ro_sort "$@"; then
-    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; return; fi
+    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; FLOOR_HIT=1; return; fi
     SEGRES=1; SEGWHY="read-only sort"; return
+  fi
+  if [ "$RO_ON" = 1 ] && [ "$prog" = "sed" ] && is_ro_sed "$@"; then
+    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; FLOOR_HIT=1; return; fi
+    SEGRES=1; SEGWHY="read-only sed"; return
   fi
 
   if [ "$RO_ON" = 1 ] && is_simple_safe "$prog"; then
-    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; return; fi
+    if args_have_secret "${@:2}"; then SEGRES=0; SEGWHY="secret-path"; FLOOR_HIT=1; return; fi
     SEGRES=1; SEGWHY="read-only $prog"; return
   fi
 
@@ -254,7 +381,9 @@ classify_tokens() {
 }
 
 # Reject shell metacharacters that are dangerous OUTSIDE quotes — command
-# substitution $(...) / `...`, redirection < >, subshell ( ), backgrounding & —
+# substitution $(...) / `...`, redirection < >, subshell ( ), backgrounding &, and
+# brace/pathname expansion { } * ? [ (bash expands these BEFORE word-splitting, e.g.
+# `git push --forc{e,e}` -> `--force`, which the resolver cannot model) —
 # with CORRECT quote semantics so a QUOTED paren/redirect in a search pattern
 # (grep "Foo(" / grep 'a>b') is NOT a false reject. Bash rules honored:
 #   single quotes  -> everything literal (safe);
@@ -277,6 +406,7 @@ has_unsafe_metachar() {
           \') st=S;;
           \") st=D;;
           '$'|'`'|'<'|'>'|'('|')') return 0;;             # active subst/redirect/subshell
+          '{'|'}'|'*'|'?'|'[') return 0;;                 # brace/pathname expansion: bash expands (e.g. --forc{e,e} -> --force) -> prompt
           '&') [ "${s:$((i+1)):1}" = "&" ] && i=$((i+1)) || return 0;;  # && ok, lone & no
         esac;;
       S)  case "$c" in \') st=N;; esac;;                   # single quote: all literal
@@ -293,11 +423,53 @@ has_unsafe_metachar() {
   return 1
 }
 
+# Resolve ONE segment into shell-faithful literal argv (global RESOLVED_TOKENS), so the
+# floor (is_destructive/args_have_secret) sees the SAME tokens the shell would execute —
+# closing the quote/escape dodge (e.g. `git push "--force"`, `git reset "--hard"`, which
+# a raw `read -ra` leaves as the quote-carrying token "--force" that the substring floor
+# then misses). Only the post-`has_unsafe_metachar` quoting subset can occur here
+# (single/double quotes + backslash; NO $()/backtick/redirect/subshell). ALSO independently
+# fail-safe: any active-expansion / redirect / subshell / lone-& / unterminated quote
+# -> return 1 so the caller PROMPTS, never guesses.
+resolve_tokens() {
+  local s="$1"; local n=${#s} i=0 c st=N word="" have=0 nx   # separate stmt: ${#s} needs s set first
+  RESOLVED_TOKENS=()
+  while [ "$i" -lt "$n" ]; do
+    c="${s:$i:1}"
+    case "$st" in
+      N)
+        case "$c" in
+          ' '|$'\t') [ "$have" = 1 ] && { RESOLVED_TOKENS+=("$word"); word=""; have=0; };;
+          '$'|'`'|'<'|'>'|'('|')'|'&') return 1;;        # active/redirect/subshell/bg -> fail safe
+          '{'|'}'|'*'|'?'|'[') return 1;;                # brace/glob expansion (bash expands before tokenizing) -> fail safe
+          \\) i=$((i+1)); word+="${s:$i:1}"; have=1;;     # escape: next char literal
+          \') st=S; have=1;;
+          \") st=D; have=1;;
+          *) word+="$c"; have=1;;
+        esac;;
+      S) case "$c" in \') st=N;; *) word+="$c";; esac;;   # single quote: all literal
+      D)
+        case "$c" in
+          '$'|'`') return 1;;                             # still active inside "" -> fail safe
+          \\) nx="${s:$((i+1)):1}"; case "$nx" in '"'|'`'|'$'|\\) word+="$nx"; i=$((i+1));; *) word+="$c";; esac;;
+          \") st=N;;
+          *) word+="$c";;
+        esac;;
+    esac
+    i=$((i+1))
+  done
+  [ "$st" = N ] || return 1                               # unterminated quote -> fail safe
+  [ "$have" = 1 ] && RESOLVED_TOKENS+=("$word")
+  return 0
+}
+
 # Classify a full Bash command line (may be a && || ; | chain) -> 0 (allow) + ALLREASON.
 classify_command() {
   local cmd="$1"
+  FLOOR_HIT=0                    # reset per top-level command; set on any is_destructive/args_have_secret hit
   [ -n "$cmd" ] || return 1
   case "$cmd" in *$'\n'*|*$'\r'*) return 1;; esac          # 2nd line would run unseen
+  cmd="$(strip_safe_redirects "$cmd")"                     # drop 2>/dev/null / 2>&1 before the gate
   has_unsafe_metachar "$cmd" && return 1                   # subst/redirect/subshell/bg (quote-aware)
 
   local sep=$'\x01' norm="$cmd"
@@ -312,8 +484,8 @@ classify_command() {
     seg="${seg#"${seg%%[![:space:]]*}"}"; seg="${seg%"${seg##*[![:space:]]}"}"
     [ -n "$seg" ] || continue
     any=1
-    local -a T=(); read -ra T <<<"$seg"
-    classify_tokens "${T[@]}"
+    resolve_tokens "$seg" || return 1   # quote/escape-faithful argv so the floor can't be dodged
+    classify_tokens "${RESOLVED_TOKENS[@]}"
     [ "$SEGRES" = 1 ] || return 1
     ALLREASON="${ALLREASON:+$ALLREASON + }$SEGWHY"
   done
@@ -337,10 +509,12 @@ case "$TOOL" in
     CMD="$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD" 2>/dev/null)"
     if classify_command "$CMD"; then
       safe=1; reason="$ALLREASON"
-    elif [ -f "$LEARNED_FILE" ] && [ -n "$CMD" ]; then
-      _found="$(jq -r --arg cmd "$CMD" '.bashCommands[]? | select(. == $cmd)' "$LEARNED_FILE" 2>/dev/null)"
-      [ -n "$_found" ] && { safe=1; reason="learned:bash"; }
+    elif [ "$OPAQUE_OK" = 1 ] && [ "$FLOOR_HIT" != 1 ] && [ -n "$CMD" ] && opaque_backstop "$CMD"; then
+      safe=1; reason="burst:opaque"
     fi
+    # ADR-028 D: exact-string learned-bash tier RETIRED — it never re-matched (write-once)
+    # and was a plaintext-secret capture surface. Reads=default-on (A) + autonomy/burst (B)
+    # cover the safe cases; the rest correctly prompt. Tool-name learning (below) stays.
     ;;
   *)
     # Write, Edit, TodoWrite, mcp__*, WebFetch, etc.: check learned file only.

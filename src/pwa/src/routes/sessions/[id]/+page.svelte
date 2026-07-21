@@ -240,13 +240,31 @@
 	// ADR-017: bridge-proved "PC is gone, B→A safe" — gates the one Tiếp quản button.
 	let takeoverSafe = $state(false);
 	const isModeB = $derived(owner === 'pc');
-	// Auto-allow SAFE read-only permission prompts (per-project flag, default OFF).
-	let autoAllow = $state({ enabled: false, autonomy: false, push: false, install: false });
+	// Auto-allow permission prompts (per-project flag). ADR-028 A: read-only is ON BY
+	// DEFAULT for workspace projects — the read row is an OPT-OUT (.ro-off).
+	let autoAllow = $state({
+		enabled: false, autonomy: false, push: false, install: false,
+		roOff: false, burstUntil: 0, burstOpaque: false
+	});
 	let autoAllowBusy = $state(false);
 	let autoAllowOpen = $state(false);
-	// Shield is "active" (filled) when either tier is on; autonomy tints it amber
-	// as a louder "you've widened beyond read-only" signal.
-	const aaActive = $derived(autoAllow.enabled || autoAllow.autonomy);
+	let burstOpaqueWanted = $state(false);
+	let nowSec = $state(Math.floor(Date.now() / 1000));
+	// Reads are on unless this project was opted out (.ro-off) — or, legacy, explicitly on.
+	const readsOn = $derived(autoAllow.enabled || !autoAllow.roOff);
+	// ADR-028 B: a time-boxed autonomy burst is active until its epoch passes.
+	const burstActive = $derived(autoAllow.burstUntil > nowSec);
+	const burstRemainMin = $derived(burstActive ? Math.ceil((autoAllow.burstUntil - nowSec) / 60) : 0);
+	// Shield is "active" (filled) when reads are on, autonomy, or a burst; autonomy/burst
+	// tint it amber as a louder "you've widened beyond read-only" signal.
+	const aaActive = $derived(readsOn || autoAllow.autonomy || burstActive);
+	const aaWarn = $derived(autoAllow.autonomy || burstActive);
+	// Tick the countdown while a burst is set (15s granularity for a minutes display).
+	$effect(() => {
+		if (!autoAllow.burstUntil) return;
+		const id = setInterval(() => (nowSec = Math.floor(Date.now() / 1000)), 15000);
+		return () => clearInterval(id);
+	});
 	// ADR-025 Slice 1: how much CC leaned on cortexplexus this session (badge only).
 	let cortex = $state<CortexUsage | null>(null);
 	const cortexBreakdown = $derived(
@@ -1582,6 +1600,20 @@
 		}
 	}
 
+	// ADR-028 B: start (minutes>0) / cancel (0) a time-boxed autonomy burst.
+	async function setBurst(minutes: number, opaque: boolean) {
+		if (autoAllowBusy) return;
+		autoAllowBusy = true;
+		try {
+			autoAllow = await sessionsApi.setBurst(projectId, minutes, opaque);
+			nowSec = Math.floor(Date.now() / 1000);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			autoAllowBusy = false;
+		}
+	}
+
 	// Restart CC tmux for this project (fires when user taps "Khởi động lại")
 	let restarting = $state(false);
 	async function restartCc() {
@@ -1697,7 +1729,7 @@
 			title="Tự duyệt lệnh (chạm để mở)"
 			aria-label="Tự duyệt lệnh"
 			aria-expanded={autoAllowOpen}
-			class="w-8 h-8 inline-flex items-center justify-center rounded-full hover:bg-[var(--color-surface)] active:scale-95 transition {autoAllow.autonomy
+			class="w-8 h-8 inline-flex items-center justify-center rounded-full hover:bg-[var(--color-surface)] active:scale-95 transition {aaWarn
 				? 'text-[var(--color-warning)]'
 				: aaActive
 					? 'text-[var(--color-accent)]'
@@ -1706,11 +1738,11 @@
 			<svg viewBox="0 0 24 24" fill={aaActive ? 'currentColor' : 'none'} stroke="currentColor"
 				 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5">
 				<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-				{#if autoAllow.autonomy}
-					<!-- exclamation = "widened beyond read-only" -->
+				{#if aaWarn}
+					<!-- exclamation = "widened beyond read-only" (autonomy or burst) -->
 					<path d="M12 8v4" stroke="var(--color-bg)" />
 					<path d="M12 16h.01" stroke="var(--color-bg)" />
-				{:else if autoAllow.enabled}
+				{:else if readsOn}
 					<path d="M9 12l2 2 4-4" stroke="var(--color-bg)" />
 				{/if}
 			</svg>
@@ -1727,11 +1759,12 @@
 				class="absolute right-0 top-9 z-30 w-[19rem] max-w-[88vw] rounded-xl bg-[var(--color-surface)] border border-[var(--color-border)] shadow-2xl p-1.5 text-[13px]"
 			>
 				{@render aaRow(
-					'Tự duyệt lệnh an toàn',
-					'Tool chỉ-đọc + Bash chỉ-đọc (kể cả lệnh nối && | ;). Không ghi / mạng / build.',
-					autoAllow.enabled,
+					'Tự duyệt lệnh an toàn (mặc định BẬT trong workspace)',
+					'Tool chỉ-đọc + Bash chỉ-đọc (kể cả lệnh nối && | ;). Không ghi / mạng / build. Tắt để buộc hỏi lại ở project này.',
+					readsOn,
 					false,
-					() => setAutoAllow({ enabled: !autoAllow.enabled })
+					// Off → opt out (.ro-off) AND clear any legacy .on; On → drop the opt-out.
+					() => setAutoAllow(readsOn ? { roOff: true, enabled: false } : { roOff: false })
 				)}
 				{@render aaRow(
 					'Tự chủ (build/test + git add/commit)',
@@ -1753,6 +1786,56 @@
 					autoAllow.install,
 					() => setAutoAllow({ install: !autoAllow.install })
 				)}
+				<div class="border-t border-[var(--color-border)]/60 my-1"></div>
+				{#if burstActive}
+					<div class="p-2 pl-3 rounded-lg bg-[var(--color-warning)]/10">
+						<div class="flex items-center justify-between gap-2">
+							<span class="font-medium text-[var(--color-warning)]"
+								>⚡ Burst còn ~{burstRemainMin}′{autoAllow.burstOpaque ? ' · opaque' : ''}</span
+							>
+							<button
+								type="button"
+								disabled={autoAllowBusy}
+								onclick={() => setBurst(0, false)}
+								class="text-[12px] px-2.5 py-1 rounded-md border border-[var(--color-border)] hover:bg-[var(--color-bg)]/60 transition disabled:opacity-40"
+								>Dừng</button
+							>
+						</div>
+						<span class="block text-[11px] leading-snug text-[var(--color-text-dim)]"
+							>Tự chủ tạm thời (build/test/git/cài gói) không hỏi, tự hết hạn. Floor + secret vẫn chặn.</span
+						>
+					</div>
+				{:else}
+					<div class="p-2 pl-3">
+						<div class="flex items-center justify-between gap-1.5 mb-0.5">
+							<span class="font-medium text-[var(--color-text)]">⚡ Burst tạm thời</span>
+							<label
+								class="flex items-center gap-1 text-[11px] text-[var(--color-text-dim)] cursor-pointer"
+							>
+								<input
+									type="checkbox"
+									bind:checked={burstOpaqueWanted}
+									class="accent-[var(--color-warning)]"
+								/> opaque
+							</label>
+						</div>
+						<span class="block text-[11px] leading-snug text-[var(--color-text-dim)] mb-1.5"
+							>Chạy trọn task không hỏi trong X phút; floor + secret vẫn chặn. “opaque” cho cả
+							ssh/python (có backstop).</span
+						>
+						<div class="flex gap-1.5">
+							{#each [30, 60, 120] as m (m)}
+								<button
+									type="button"
+									disabled={autoAllowBusy}
+									onclick={() => setBurst(m, burstOpaqueWanted)}
+									class="flex-1 text-[12px] py-1 rounded-md border border-[var(--color-border)] hover:bg-[var(--color-warning)]/10 transition disabled:opacity-40"
+									>{m}′</button
+								>
+							{/each}
+						</div>
+					</div>
+				{/if}
 			</div>
 		{/if}
 	</div>

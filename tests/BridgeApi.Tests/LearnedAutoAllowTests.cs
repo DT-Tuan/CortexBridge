@@ -3,8 +3,8 @@ using CortexBridge.Api.Endpoints;
 namespace CortexBridge.Api.Tests;
 
 /// <summary>
-/// Guards LearnedAutoAllow: per-project command-learning store written by the
-/// bridge (POST /autoallow/learn) and read by the host PreToolUse hook.
+/// Guards LearnedAutoAllow. ADR-028 D: exact-string Bash learning is RETIRED (it never
+/// re-matched and captured plaintext secrets); only tool-NAME learning survives.
 /// </summary>
 public class LearnedAutoAllowTests : IDisposable
 {
@@ -24,12 +24,13 @@ public class LearnedAutoAllowTests : IDisposable
     }
 
     [Fact]
-    public void Append_BashCommand_AppearsInBashCommands()
+    public void Append_BashCommand_IsRetired_NotStored()
     {
         LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "git status");
+        LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "ssh host 'grep TOKEN .env'");
 
         var data = LearnedAutoAllow.ReadData(_flagDir, Proj);
-        Assert.Contains("git status", data.BashCommands);
+        Assert.Empty(data.BashCommands);   // Bash learning retired — nothing captured (no secret surface)
         Assert.Empty(data.Tools);
     }
 
@@ -44,16 +45,6 @@ public class LearnedAutoAllowTests : IDisposable
     }
 
     [Fact]
-    public void Append_SameBashCommand_Twice_StoredOnce()
-    {
-        LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "git diff");
-        LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "git diff");
-
-        var data = LearnedAutoAllow.ReadData(_flagDir, Proj);
-        Assert.Single(data.BashCommands);
-    }
-
-    [Fact]
     public void Append_SameTool_Twice_StoredOnce()
     {
         LearnedAutoAllow.Append(_flagDir, Proj, "Grep", "");
@@ -64,27 +55,6 @@ public class LearnedAutoAllowTests : IDisposable
     }
 
     [Fact]
-    public void Append_MultipleBashCommands_AllStored()
-    {
-        LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "ls -la");
-        LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "cat README.md");
-
-        var data = LearnedAutoAllow.ReadData(_flagDir, Proj);
-        Assert.Contains("ls -la", data.BashCommands);
-        Assert.Contains("cat README.md", data.BashCommands);
-        Assert.Equal(2, data.BashCommands.Count);
-    }
-
-    [Fact]
-    public void Append_EmptyBashCommand_NotStored()
-    {
-        LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "");
-
-        var data = LearnedAutoAllow.ReadData(_flagDir, Proj);
-        Assert.Empty(data.BashCommands);
-    }
-
-    [Fact]
     public void Append_EmptyTool_NotStored()
     {
         LearnedAutoAllow.Append(_flagDir, Proj, "", "some command");
@@ -92,6 +62,16 @@ public class LearnedAutoAllowTests : IDisposable
         var data = LearnedAutoAllow.ReadData(_flagDir, Proj);
         Assert.Empty(data.Tools);
         Assert.Empty(data.BashCommands);
+    }
+
+    [Fact]
+    public void NeverLearnTools_NotStored()
+    {
+        LearnedAutoAllow.Append(_flagDir, Proj, "AskUserQuestion", "");
+        LearnedAutoAllow.Append(_flagDir, Proj, "ExitPlanMode", "");
+
+        var data = LearnedAutoAllow.ReadData(_flagDir, Proj);
+        Assert.Empty(data.Tools);
     }
 
     [Fact]
@@ -108,17 +88,17 @@ public class LearnedAutoAllowTests : IDisposable
         Directory.CreateDirectory(_flagDir);
         File.WriteAllText(Path.Combine(_flagDir, Proj + ".learned.json"), "not valid json {{{{");
 
-        var ex = Record.Exception(() => LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "git log"));
+        var ex = Record.Exception(() => LearnedAutoAllow.Append(_flagDir, Proj, "Write", ""));
         Assert.Null(ex);
 
         var data = LearnedAutoAllow.ReadData(_flagDir, Proj);
-        Assert.Contains("git log", data.BashCommands);
+        Assert.Contains("Write", data.Tools);
     }
 
     [Fact]
-    public void JsonFile_CamelCase_BashCommandsKey()
+    public void JsonFile_CamelCase_Keys()
     {
-        LearnedAutoAllow.Append(_flagDir, Proj, "Bash", "pwd");
+        LearnedAutoAllow.Append(_flagDir, Proj, "Write", "");
 
         var raw = File.ReadAllText(Path.Combine(_flagDir, Proj + ".learned.json"));
         Assert.Contains("bashCommands", raw);

@@ -25,7 +25,7 @@ public class AutoAllowFlagsTests : IDisposable
     }
 
     private AutoAllowFlags.SetRequest Req(bool? on = null, bool? autonomy = null,
-        bool? push = null, bool? install = null) => new(on, autonomy, push, install);
+        bool? push = null, bool? install = null, bool? roOff = null) => new(on, autonomy, push, install, roOff);
 
     [Fact]
     public void DefaultState_AllOff()
@@ -35,6 +35,56 @@ public class AutoAllowFlagsTests : IDisposable
         Assert.False(s.Autonomy);
         Assert.False(s.Push);
         Assert.False(s.Install);
+        Assert.False(s.RoOff);
+    }
+
+    [Fact]
+    public void RoOff_OptOutFlag_IndependentAndReversible()
+    {
+        var (s, changed) = AutoAllowFlags.Apply(_flagDir, Proj, Req(roOff: true));
+        Assert.True(s.RoOff);
+        Assert.False(s.Enabled);
+        Assert.True(File.Exists(Path.Combine(_flagDir, Proj + ".ro-off")));
+        Assert.Contains("ro-off=on", changed);
+
+        var (s2, changed2) = AutoAllowFlags.Apply(_flagDir, Proj, Req(roOff: false));
+        Assert.False(s2.RoOff);
+        Assert.False(File.Exists(Path.Combine(_flagDir, Proj + ".ro-off")));
+        Assert.Contains("ro-off=off", changed2);
+    }
+
+    [Fact]
+    public void Burst_SetReadCancel()
+    {
+        var (until, opaque) = AutoAllowFlags.SetBurst(_flagDir, Proj, minutes: 30, opaque: true);
+        Assert.True(until > DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        Assert.True(opaque);
+        var s = AutoAllowFlags.Read(_flagDir, Proj);
+        Assert.Equal(until, s.BurstUntil);
+        Assert.True(s.BurstOpaque);
+
+        AutoAllowFlags.SetBurst(_flagDir, Proj, minutes: 0, opaque: false);   // cancel
+        var s2 = AutoAllowFlags.Read(_flagDir, Proj);
+        Assert.Equal(0, s2.BurstUntil);
+        Assert.False(File.Exists(Path.Combine(_flagDir, Proj + ".burst")));
+    }
+
+    [Fact]
+    public void Burst_ExpiredReadsAsZeroAndDeletes()
+    {
+        var path = Path.Combine(_flagDir, Proj + ".burst");
+        Directory.CreateDirectory(_flagDir);
+        File.WriteAllText(path, (DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10) + "\n");
+        Assert.Equal(0, AutoAllowFlags.Read(_flagDir, Proj).BurstUntil);
+        Assert.False(File.Exists(path));   // expired -> cleaned on read
+    }
+
+    [Fact]
+    public void Burst_ClampedToCeiling()
+    {
+        var (until, _) = AutoAllowFlags.SetBurst(_flagDir, Proj, minutes: 100_000, opaque: false);
+        var maxExp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 8 * 60 * 60 + 5;
+        Assert.True(until <= maxExp, $"burst {until} exceeded 8h ceiling {maxExp}");
     }
 
     [Fact]
