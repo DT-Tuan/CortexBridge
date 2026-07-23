@@ -263,24 +263,74 @@ set_flags
 : > "$TMP/cortex-autoallow/other.on"
 expect prompt "wrong-project flag" Bash "$(bash_in 'ls')"
 
-echo "== ADR-028 A: read-only ON by default under workspace root, opt-out via .ro-off =="
+echo "== ADR-028 A+E: workspace root grants read + autonomy + install by default =="
 set_flags                                 # NO flag files at all
 CWD="$TMP/ws/proj"                        # basename proj; under CC_AUTOALLOW_RO_ROOTS=$TMP/ws
 expect allow  "workspace read (no flag)"     Bash "$(bash_in 'grep -n foo src/x.cs')"
 expect allow  "workspace cat (no flag)"      Bash "$(bash_in 'cat README.md')"
 expect allow  "workspace Read tool"          Read '{"file_path":"/x"}'
-expect prompt "workspace build still gated"  Bash "$(bash_in 'npm run build')"
+# E: autonomy + install now DEFAULT-ON inside a workspace project
+expect allow  "workspace build (E default)"  Bash "$(bash_in 'npm run build')"
+expect allow  "workspace dotnet test (E)"    Bash "$(bash_in 'dotnet test')"
+expect allow  "workspace git commit (E)"     Bash "$(bash_in 'git commit -m x')"
+expect allow  "workspace npm install (E)"    Bash "$(bash_in 'npm install')"
+# but the guarded classes stay gated even in a workspace project
 expect prompt "workspace floor still on"     Bash "$(bash_in 'rm -rf /tmp/x')"
 expect prompt "workspace secret still on"    Bash "$(bash_in 'cat .env')"
+expect prompt "workspace push still gated"   Bash "$(bash_in 'git push origin main')"
+expect prompt "workspace force-push floor"   Bash "$(bash_in 'git push --force origin m')"
+expect prompt "workspace opaque gated (no .trust)" Bash "$(bash_in "ssh h 'systemctl restart x'")"
 expect prompt "workspace Write still gated"  Write '{"file_path":"/x","content":"y"}'
-: > "$TMP/cortex-autoallow/proj.ro-off"    # opt this project out
-expect prompt "workspace .ro-off opts out"   Bash "$(bash_in 'grep -n foo src/x.cs')"
+# opt-outs
+: > "$TMP/cortex-autoallow/proj.autonomy-off"   # keep reads, drop autonomy
+expect allow  ".autonomy-off keeps reads"    Bash "$(bash_in 'cat README.md')"
+expect prompt ".autonomy-off drops build"    Bash "$(bash_in 'npm run build')"
+expect prompt ".autonomy-off drops commit"   Bash "$(bash_in 'git commit -m x')"
+rm -f "$TMP/cortex-autoallow/proj.autonomy-off"
+: > "$TMP/cortex-autoallow/proj.ro-off"         # kill ALL workspace defaults
+expect prompt ".ro-off kills reads"          Bash "$(bash_in 'grep -n foo src/x.cs')"
 expect prompt ".ro-off blocks Read too"      Read '{"file_path":"/x"}'
+expect prompt ".ro-off kills build too"      Bash "$(bash_in 'npm run build')"
 rm -f "$TMP/cortex-autoallow/proj.ro-off"
 CWD="/home/x/elsewhere/proj"              # outside the workspace root
 expect prompt "outside workspace gated"      Bash "$(bash_in 'ls')"
 CWD="$TMP/ws/../ws/proj"                  # non-canonical path never default-on
 expect prompt "dotdot path not default-on"   Bash "$(bash_in 'ls')"
+
+echo "== ADR-028 G: project-root resolution (subdir + memory dir inherit the project) =="
+set_flags
+# (a) a SUBDIR under the workspace inherits the workspace defaults — this is the live
+# project-eta bug: git commit / build in …/06.Sidecars/x used to prompt.
+CWD="$TMP/ws/proj/06.Sidecars/voice-gw"
+expect allow  "subdir cat (RO inherit)"      Bash "$(bash_in 'cat README.md')"
+expect allow  "subdir git commit (E inherit)" Bash "$(bash_in 'git commit -m x')"
+expect allow  "subdir npm build (E inherit)" Bash "$(bash_in 'npm run build')"
+expect prompt "subdir floor still on"        Bash "$(bash_in 'rm -rf /tmp/x')"
+expect prompt "subdir push still gated"      Bash "$(bash_in 'git push origin main')"
+# (b) the project's ~/.claude/projects/<enc>/memory dir maps back to the project.
+# <enc> = the workspace root path with '/' -> '-', then '-proj'. CLAUDE_DIR=$TMP here.
+ENC="${TMP//\//-}-ws-proj"                # e.g. -tmp-tmp.X-ws-proj
+CWD="$TMP/projects/$ENC/memory"
+expect allow  "memory-dir cat (RO inherit)"  Bash "$(bash_in 'cat foo.md')"
+expect allow  "memory-dir git log (RO)"      Bash "$(bash_in 'git log --oneline -5')"
+expect prompt "memory-dir secret floor"      Bash "$(bash_in 'cat /home/x/.ssh/id_rsa')"
+# a NON-workspace-encoded data dir must NOT be treated as in-workspace
+CWD="$TMP/projects/-home-x-elsewhere-proj/memory"
+expect prompt "non-ws memory dir gated"      Bash "$(bash_in 'cat foo.md')"
+
+echo "== ADR-028 E: .trust = persistent opaque per project (autonomy+install+opaque) =="
+set_flags; : > "$TMP/cortex-autoallow/proj.trust"
+CWD="/home/x/elsewhere/proj"              # even OUTSIDE workspace, .trust grants the set
+expect allow  ".trust build"                 Bash "$(bash_in 'npm run build')"
+expect allow  ".trust git commit"            Bash "$(bash_in 'git commit -m x')"
+expect allow  ".trust npm install"           Bash "$(bash_in 'npm install')"
+expect allow  ".trust ssh opaque benign"     Bash "$(bash_in "ssh h 'systemctl restart nginx'")"
+expect allow  ".trust python heredoc-ish"    Bash "$(bash_in 'python3 deploy.py --env prod')"
+expect prompt ".trust rm floor"              Bash "$(bash_in 'rm -rf /tmp/x')"
+expect prompt ".trust remote rm (backstop)"  Bash "$(bash_in "ssh h 'rm -rf /'")"
+expect prompt ".trust secret (backstop)"     Bash "$(bash_in 'cat /home/x/.ssh/id_rsa')"
+expect prompt ".trust push still gated"      Bash "$(bash_in 'git push origin main')"
+rm -f "$TMP/cortex-autoallow/proj.trust"
 
 echo "== ADR-028 B: time-boxed autonomy burst + opaque-ok backstop =="
 set_flags; rm -f "$TMP/cortex-autoallow/proj.ro-off"

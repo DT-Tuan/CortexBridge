@@ -142,16 +142,20 @@ public static class AutoAllowFlags
     // name/.on suffix so the pre-existing PWA toggle (sends {enabled}) still works.
     private static readonly (string Suffix, Func<SetRequest, bool?> Get)[] Map =
     {
-        (".on",       r => r.Enabled),
-        (".autonomy", r => r.Autonomy),
-        (".push",     r => r.Push),
-        (".install",  r => r.Install),
-        (".ro-off",   r => r.RoOff),   // ADR-028 A: opt-out of default-on read-only
+        (".on",           r => r.Enabled),
+        (".autonomy",     r => r.Autonomy),
+        (".push",         r => r.Push),
+        (".install",      r => r.Install),
+        (".ro-off",       r => r.RoOff),        // ADR-028 A: opt-out of default-on read-only
+        (".trust",        r => r.Trust),        // ADR-028 E: full trust (autonomy+install+opaque)
+        (".autonomy-off", r => r.AutonomyOff),  // ADR-028 E: opt-out of default-on autonomy+install
     };
 
     public record State(bool Enabled, bool Autonomy, bool Push, bool Install, bool RoOff,
+        bool Trust, bool AutonomyOff,
         long BurstUntil, bool BurstOpaque);
-    public record SetRequest(bool? Enabled, bool? Autonomy, bool? Push, bool? Install, bool? RoOff);
+    public record SetRequest(bool? Enabled, bool? Autonomy, bool? Push, bool? Install, bool? RoOff,
+        bool? Trust, bool? AutonomyOff);
     public record BurstRequest(int Minutes, bool Opaque);
 
     /// <summary>
@@ -188,6 +192,8 @@ public static class AutoAllowFlags
             Push: File.Exists(Path.Combine(flagDir, projectId + ".push")),
             Install: File.Exists(Path.Combine(flagDir, projectId + ".install")),
             RoOff: File.Exists(Path.Combine(flagDir, projectId + ".ro-off")),
+            Trust: File.Exists(Path.Combine(flagDir, projectId + ".trust")),
+            AutonomyOff: File.Exists(Path.Combine(flagDir, projectId + ".autonomy-off")),
             BurstUntil: burstUntil,
             BurstOpaque: burstOpaque);
     }

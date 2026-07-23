@@ -196,6 +196,24 @@ public static class InternalHooksEndpoints
         }
     }
 
+    /// <summary>
+    /// ADR-028 F — resolve the permission-prompt push debounce from config/env.
+    /// Default 4s; clamp to [0, 30]. 0 = send immediately (legacy behaviour).
+    /// </summary>
+    public static int ResolvePushDelaySeconds(IConfiguration config)
+    {
+        var raw = config.GetValue<int?>("BRIDGE_PUSH_DELAY_SECONDS");
+        if (raw is null)
+        {
+            var env = Environment.GetEnvironmentVariable("BRIDGE_PUSH_DELAY_SECONDS");
+            if (int.TryParse(env, out var fromEnv)) raw = fromEnv;
+        }
+        var sec = raw ?? 4;
+        if (sec < 0) return 0;
+        if (sec > 30) return 30;
+        return sec;
+    }
+
     private static async Task<IResult> NotificationHandler(
         HttpContext ctx,
         HookTokenProvider tokens,
@@ -203,6 +221,7 @@ public static class InternalHooksEndpoints
         SessionScanner scanner,
         WebPushSender webPush,
         BridgeDbContext db,
+        IServiceScopeFactory scopeFactory,
         IConfiguration config,
         ILoggerFactory loggerFactory,
         CancellationToken ct)
@@ -324,22 +343,62 @@ public static class InternalHooksEndpoints
             : null;
 
         var msgText = payload.Message ?? "Claude needs input";
+        var title = $"{payload.ProjectId} needs input";
+        var projectId = payload.ProjectId;
 
-        // Fan out to all subscribed PWA clients via Web Push. Per-subscription
-        // failures are non-fatal (stale subs auto-removed inside SendToAllAsync).
-        try
+        // ADR-028 F — debounce lockscreen push: only send if the prompt is STILL
+        // pending after a short beat (user may have resolved it at the PC, or
+        // auto-allow/CC may have cleared it). delaySec<=0 keeps legacy immediate send.
+        var delaySec = ResolvePushDelaySeconds(config);
+        if (delaySec <= 0)
         {
-            await webPush.SendToAllAsync(
-                db,
-                payload.ProjectId,
-                title: $"{payload.ProjectId} needs input",
-                body: msgText,
-                clickUrl: clickUrl,
-                work.Token);
+            try
+            {
+                await webPush.SendToAllAsync(
+                    db, projectId, title: title, body: msgText, clickUrl: clickUrl, work.Token);
+            }
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "Web Push fanout failed for {Project}", projectId);
+            }
         }
-        catch (Exception ex)
+        else
         {
-            log.LogWarning(ex, "Web Push fanout failed for {Project}", payload.ProjectId);
+            // Fire-and-forget: handler returns 202 immediately. Own work token +
+            // scoped DbContext — request-scoped `db`/`work` dispose at handler return.
+            // Delay uses CancellationToken.None (not request ct, not work token).
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(delaySec), CancellationToken.None);
+                    if (!state.NeedsInput(projectId, sessionId))
+                    {
+                        log.LogInformation(
+                            "Push suppressed for {Project}: prompt resolved within {Delay}s",
+                            projectId, delaySec);
+                        return;
+                    }
+
+                    using var pushWork = AcceptedWork();
+                    try
+                    {
+                        using var scope = scopeFactory.CreateScope();
+                        var scopedDb = scope.ServiceProvider.GetRequiredService<BridgeDbContext>();
+                        await webPush.SendToAllAsync(
+                            scopedDb, projectId, title: title, body: msgText,
+                            clickUrl: clickUrl, pushWork.Token);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogWarning(ex, "Web Push fanout failed for {Project}", projectId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log.LogWarning(ex, "Delayed push task failed for {Project}", projectId);
+                }
+            });
         }
 
         return Results.Json(new { acceptedAt = DateTimeOffset.UtcNow.ToString("o") },

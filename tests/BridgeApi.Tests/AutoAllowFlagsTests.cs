@@ -25,7 +25,9 @@ public class AutoAllowFlagsTests : IDisposable
     }
 
     private AutoAllowFlags.SetRequest Req(bool? on = null, bool? autonomy = null,
-        bool? push = null, bool? install = null, bool? roOff = null) => new(on, autonomy, push, install, roOff);
+        bool? push = null, bool? install = null, bool? roOff = null,
+        bool? trust = null, bool? autonomyOff = null)
+        => new(on, autonomy, push, install, roOff, trust, autonomyOff);
 
     [Fact]
     public void DefaultState_AllOff()
@@ -36,6 +38,8 @@ public class AutoAllowFlagsTests : IDisposable
         Assert.False(s.Push);
         Assert.False(s.Install);
         Assert.False(s.RoOff);
+        Assert.False(s.Trust);
+        Assert.False(s.AutonomyOff);
     }
 
     [Fact]
@@ -51,6 +55,38 @@ public class AutoAllowFlagsTests : IDisposable
         Assert.False(s2.RoOff);
         Assert.False(File.Exists(Path.Combine(_flagDir, Proj + ".ro-off")));
         Assert.Contains("ro-off=off", changed2);
+    }
+
+    [Fact]
+    public void Trust_Flag_IndependentAndReversible()
+    {
+        var (s, changed) = AutoAllowFlags.Apply(_flagDir, Proj, Req(trust: true));
+        Assert.True(s.Trust);
+        Assert.False(s.Enabled);
+        Assert.False(s.AutonomyOff);
+        Assert.True(File.Exists(Path.Combine(_flagDir, Proj + ".trust")));
+        Assert.Contains("trust=on", changed);
+
+        var (s2, changed2) = AutoAllowFlags.Apply(_flagDir, Proj, Req(trust: false));
+        Assert.False(s2.Trust);
+        Assert.False(File.Exists(Path.Combine(_flagDir, Proj + ".trust")));
+        Assert.Contains("trust=off", changed2);
+    }
+
+    [Fact]
+    public void AutonomyOff_OptOutFlag_IndependentAndReversible()
+    {
+        var (s, changed) = AutoAllowFlags.Apply(_flagDir, Proj, Req(autonomyOff: true));
+        Assert.True(s.AutonomyOff);
+        Assert.False(s.Autonomy);
+        Assert.False(s.Trust);
+        Assert.True(File.Exists(Path.Combine(_flagDir, Proj + ".autonomy-off")));
+        Assert.Contains("autonomy-off=on", changed);
+
+        var (s2, changed2) = AutoAllowFlags.Apply(_flagDir, Proj, Req(autonomyOff: false));
+        Assert.False(s2.AutonomyOff);
+        Assert.False(File.Exists(Path.Combine(_flagDir, Proj + ".autonomy-off")));
+        Assert.Contains("autonomy-off=off", changed2);
     }
 
     [Fact]

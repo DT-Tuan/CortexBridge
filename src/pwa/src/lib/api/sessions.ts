@@ -23,6 +23,8 @@ export type AutoAllowState = {
 	push: boolean; // sub-flag: allow git push (.push)
 	install: boolean; // sub-flag: allow package installs (.install)
 	roOff: boolean; // ADR-028 A: opt-out of default-on read-only in workspace (.ro-off)
+	trust: boolean; // ADR-028 E: full trust — autonomy+install+opaque (.trust)
+	autonomyOff: boolean; // ADR-028 E: opt-out of default-on autonomy+install (.autonomy-off)
 	burstUntil: number; // ADR-028 B: burst expiry epoch (seconds); 0 if none/expired
 	burstOpaque: boolean; // ADR-028 B: burst also allows opaque cmds (ssh/python) past the backstop
 };

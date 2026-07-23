@@ -6,23 +6,29 @@
 # {permissionDecision:"allow"} for allowed tool calls so CC runs them with NO
 # prompt at all. Native, runtime-toggleable, zero pane race.
 #
-# TWO independent per-project tiers (flag files under $CLAUDE_DIR/cortex-autoallow/,
-# created/removed by the bridge on the PWA toggles; default OFF). projectId = basename(cwd):
-#   <id>.on        -> SAFE tier: read-only tools + read-only Bash (single OR chained
-#                     read-only commands). Nothing here can write/network/delete.
-#   <id>.autonomy  -> TRUST tier (implies read-only): also allow build/test/lint/format
-#                     and local git (add/commit/stash). NOTE: build/test EXECUTE
-#                     ARBITRARY CODE (package scripts, test code) — this tier is a
-#                     statement of TRUST in the project, not a safety guarantee.
-#       <id>.push    -> sub-flag: also allow `git push` (NOT --force). outward + hard
-#                       to undo; off by default even under autonomy.
-#       <id>.install -> sub-flag: also allow package installs (npm/pnpm/yarn install,
-#                       dotnet restore, pip install) — postinstall scripts + network.
+# Per-project tiers (flag files under $CLAUDE_DIR/cortex-autoallow/, created/removed by
+# the bridge on the PWA toggles). projectId = the OWNING project root (resolve_project,
+# ADR-028 G) — NOT basename(cwd) — so a command's subtree keeps the project's tiers.
 #
-# ALWAYS-UNSAFE (even under autonomy): destructive commands (rm/dd/mkfs, git reset
-# --hard, git clean, git push --force, git branch -D, force checkout) and anything
-# carrying shell redirection / command substitution / subshell / backgrounding.
-# Anything not provably allowed falls through with no output -> CC prompts as usual.
+# WORKSPACE DEFAULT (ADR-028 A+E): inside a workspace project (IN_WS) the read-only AND
+# autonomy+install tiers are ON BY DEFAULT — the Class-Y recoverable set — with no flag.
+#   <id>.on          -> SAFE tier: read-only tools + read-only Bash. No write/net/delete.
+#   <id>.autonomy    -> TRUST tier (implies read-only): build/test/lint/format + local
+#                       git (add/commit/stash). NOTE: build/test/install EXECUTE ARBITRARY
+#                       PROJECT CODE — a statement of TRUST, not a safety guarantee.
+#       <id>.push     -> sub-flag: also `git push` (NOT --force). Outward + hard to undo;
+#                        stays OFF by default even in a workspace project.
+#       <id>.install  -> package installs (npm/pnpm/yarn install, dotnet restore, pip).
+#   <id>.trust       -> persistent "full trust": autonomy + install + OPAQUE (ssh bodies,
+#                       $(), heredocs, arbitrary programs) with no expiry. One tap/project.
+#   <id>.ro-off      -> opt this project OUT of ALL workspace defaults (reads + autonomy).
+#   <id>.autonomy-off-> keep default reads, drop default autonomy + install.
+#   <id>.burst       -> time-boxed elevation (see ADR-028 B, below).
+#
+# ALWAYS-UNSAFE (Class-X floor, even under trust/burst): destructive commands (rm/dd/mkfs,
+# git reset --hard, git clean, git push --force, git branch -D, force checkout), secret
+# reads, exfil forms, and anything carrying shell redirection / command substitution /
+# subshell / backgrounding. Anything not provably allowed -> no output -> CC prompts.
 #
 # HARD RULES (this is in CC's critical path — a misbehaving hook can WRONGLY allow or
 # can hang the turn):
@@ -46,44 +52,88 @@ TOKEN_FILE="${BRIDGE_HOOK_TOKEN_FILE:-/opt/cortex/data/sqlite/bridge-hook-token}
 BRIDGE_URL="${BRIDGE_INTERNAL_URL:-http://127.0.0.1:3000}"
 
 # --- resolve project + gate on the per-project flags (cheapest checks first) ---
+# ADR-028 (G): resolve the OWNING project, NOT basename(cwd). CC runs commands from
+# subdirs (…/project-eta/06.Sidecars/x) and even the project's ~/.claude memory dir;
+# keying flags on basename(cwd) made each of those a DIFFERENT projectId, so the
+# project's flags (autonomy/push/trust) silently stopped applying and reads outside
+# ~/workspace re-prompted (live-caught on project-eta). resolve_project walks up to the
+# workspace-root child, and maps the ~/.claude/projects/<enc>/… data dir back to its
+# project, setting:
+#   PROJECT_ID — the project the flag files are keyed on (basename of project root)
+#   IN_WS      — 1 if the command runs inside a workspace project's subtree (incl. its
+#                memory dir); grants the workspace default tiers below.
+RO_ROOTS_RAW="${CC_AUTOALLOW_RO_ROOTS:-$HOME/workspace}"
+resolve_project() {
+  local cwd="$1" r rest projroot enc encr
+  PROJECT_ID="${cwd##*/}"; IN_WS=0
+  [ -n "$cwd" ] || return 0
+  case "$cwd" in *..*) return 0;; esac              # non-canonical -> basename, never in-ws
+  local -a _R; IFS=':' read -ra _R <<<"$RO_ROOTS_RAW"
+  # (1) under a workspace root -> project = FIRST path segment below the root
+  for r in "${_R[@]}"; do
+    [ -n "$r" ] || continue
+    if [ "$cwd" = "$r" ]; then IN_WS=1; return 0; fi # cwd IS the root (rare) -> basename
+    rest="${cwd#"$r"/}"
+    if [ "$rest" != "$cwd" ]; then PROJECT_ID="${rest%%/*}"; IN_WS=1; return 0; fi
+  done
+  # (2) under ~/.claude/projects/<enc>/… -> map <enc> (CC encodes the project path with
+  # '/' -> '-') back to its workspace project so the project's own memory dir inherits
+  # its tiers. Best-effort: exact for dash-free project names (project-eta/CortexBridge/project-zeta).
+  projroot="$CLAUDE_DIR/projects"
+  rest="${cwd#"$projroot"/}"
+  if [ "$rest" != "$cwd" ]; then
+    enc="${rest%%/*}"
+    for r in "${_R[@]}"; do
+      [ -n "$r" ] || continue
+      encr="${r//\//-}"                             # /home/u/workspace -> -home-u-workspace
+      case "$enc" in
+        "$encr"-*) PROJECT_ID="${enc#"$encr"-}"; IN_WS=1; return 0;;
+      esac
+    done
+  fi
+  # (3) fallback: basename(cwd), not in workspace (safe default = prior behaviour)
+  return 0
+}
 CWD="$(jq -r '.cwd // empty' <<<"$PAYLOAD" 2>/dev/null)"
-PROJECT_ID="${CWD##*/}"
+resolve_project "$CWD"
 [ -n "$PROJECT_ID" ] || exit 0
 
-RO_ON=0; AUTON=0; PUSH_OK=0; INSTALL_OK=0
+RO_ON=0; AUTON=0; PUSH_OK=0; INSTALL_OK=0; TRUST=0; OPAQUE_OK=0
 [ -f "$FLAG_DIR/$PROJECT_ID.on" ] && RO_ON=1
 [ -f "$FLAG_DIR/$PROJECT_ID.autonomy" ] && AUTON=1
 [ -f "$FLAG_DIR/$PROJECT_ID.push" ] && PUSH_OK=1
 [ -f "$FLAG_DIR/$PROJECT_ID.install" ] && INSTALL_OK=1
-[ "$AUTON" = 1 ] && RO_ON=1   # autonomy includes the read-only set
+[ -f "$FLAG_DIR/$PROJECT_ID.trust" ] && TRUST=1
 
-# ADR-028 (A): the READ-ONLY tier is ON BY DEFAULT for projects under a workspace
-# root (where real dev happens) — so reads / read-only Bash stop prompting without a
-# per-project opt-in — UNLESS the user opted this project out with a .ro-off file.
-# Dirs OUTSIDE the workspace (e.g. ~/.ssh, /etc) stay gated. Only the read tier is
-# defaulted; autonomy/push/install stay explicit opt-in. Roots are colon-separated
-# (CC_AUTOALLOW_RO_ROOTS), default ~/workspace.
-if [ "$RO_ON" != 1 ] && [ ! -f "$FLAG_DIR/$PROJECT_ID.ro-off" ]; then
-  case "$CWD" in
-    ""|*..*) : ;;                    # empty or non-canonical path -> never default-on
-    *)
-      IFS=':' read -ra _RO_ROOTS <<<"${CC_AUTOALLOW_RO_ROOTS:-$HOME/workspace}"
-      for _r in "${_RO_ROOTS[@]}"; do
-        [ -n "$_r" ] || continue
-        if [ "$CWD" = "$_r" ] || [ "${CWD#"$_r"/}" != "$CWD" ]; then
-          RO_ON=1; break
-        fi
-      done
-      ;;
-  esac
+# ADR-028 (A+E+G): a workspace project's WHOLE subtree (resolved via IN_WS above, so
+# subdirs + its ~/.claude memory dir count) gets read-only AND autonomy+install ON BY
+# DEFAULT — the Class-Y recoverable set, where real dev happens. The Class-X floor +
+# secret denylist below still apply unconditionally. Dirs OUTSIDE any workspace root
+# (~/.ssh, /etc, a repo elsewhere) stay gated. Per-project opt-outs:
+#   .ro-off        -> kill ALL workspace defaults (reads + autonomy)
+#   .autonomy-off  -> keep default reads, drop default autonomy + install
+# push stays gated (needs .push) and opaque stays gated (needs .trust) even here.
+if [ "$IN_WS" = 1 ] && [ ! -f "$FLAG_DIR/$PROJECT_ID.ro-off" ]; then
+  RO_ON=1
+  [ -f "$FLAG_DIR/$PROJECT_ID.autonomy-off" ] || { AUTON=1; INSTALL_OK=1; }
 fi
+
+# ADR-028 (E): .trust = persistent, per-project "full trust" (one tap in the PWA) — a
+# STANDING burst-opaque with no expiry: autonomy + install + opaque. Class-X floor +
+# opaque_backstop stay enforced; push is still separate. Scoped per project on purpose
+# so the prompt-injection blast-radius stays contained to projects the operator chose.
+if [ "$TRUST" = 1 ]; then
+  RO_ON=1; AUTON=1; INSTALL_OK=1; OPAQUE_OK=1
+fi
+
+[ "$AUTON" = 1 ] && RO_ON=1   # autonomy includes the read-only set
 
 # ADR-028 (B): time-boxed autonomy BURST. A .burst flag's first line is an expiry epoch
 # (optional 2nd word "opaque"). While unexpired it grants autonomy + installs (Class Y),
 # auto-expiring; the Class-X floor + secret denylist still apply (classify_command is
 # unchanged). "opaque" additionally lets normally-unanalyzable commands (ssh bodies,
 # heredocs, $()) run — but only past the opaque_backstop RAW scan (see below).
-BURST=0; OPAQUE_OK=0
+BURST=0   # OPAQUE_OK already initialised above (may be set by .trust)
 if [ -f "$FLAG_DIR/$PROJECT_ID.burst" ]; then
   read -r _bexp _bopq _brest < "$FLAG_DIR/$PROJECT_ID.burst" 2>/dev/null || true
   case "$_bexp" in
@@ -200,6 +250,7 @@ opaque_backstop() {   # $1 = raw command; 0 = safe to allow, 1 = block (prompt)
   case " $s " in
     *" rm "*|*" rmdir "*|*" shred "*|*" dd "*|*" mkfs "*|*" mkfs."*|*" fdisk "*|*" sfdisk "*|*" wipefs "*) return 1;;
     *" --no-preserve-root "*|*" --force "*|*" --force-with-lease "*|*" --hard "*) return 1;;
+    *" push "*) return 1;;   # outward: git/docker push stays gated even under opaque (.trust/.burst) — needs explicit .push
   esac
   case " $sec " in   # secret-path substrings (quotes stripped so ~/.ss''h -> ~/.ssh; separators/paths intact)
     */.ssh/*|*id_rsa*|*id_ed25519*|*id_ecdsa*|*id_dsa*|*.pem*|*.key*|*.p12*|*.pfx*) return 1;;
@@ -510,7 +561,7 @@ case "$TOOL" in
     if classify_command "$CMD"; then
       safe=1; reason="$ALLREASON"
     elif [ "$OPAQUE_OK" = 1 ] && [ "$FLOOR_HIT" != 1 ] && [ -n "$CMD" ] && opaque_backstop "$CMD"; then
-      safe=1; reason="burst:opaque"
+      safe=1; reason="$([ "$TRUST" = 1 ] && printf trust:opaque || printf burst:opaque)"
     fi
     # ADR-028 D: exact-string learned-bash tier RETIRED — it never re-matched (write-once)
     # and was a plaintext-secret capture surface. Reads=default-on (A) + autonomy/burst (B)

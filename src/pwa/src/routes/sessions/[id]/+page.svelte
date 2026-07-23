@@ -240,11 +240,12 @@
 	// ADR-017: bridge-proved "PC is gone, B→A safe" — gates the one Tiếp quản button.
 	let takeoverSafe = $state(false);
 	const isModeB = $derived(owner === 'pc');
-	// Auto-allow permission prompts (per-project flag). ADR-028 A: read-only is ON BY
-	// DEFAULT for workspace projects — the read row is an OPT-OUT (.ro-off).
+	// Auto-allow permission prompts (per-project flag). ADR-028 A/E: read-only AND
+	// autonomy+install are ON BY DEFAULT for workspace projects — those rows are
+	// OPT-OUTS (.ro-off / .autonomy-off). .trust is a persistent "full trust" opt-in.
 	let autoAllow = $state({
 		enabled: false, autonomy: false, push: false, install: false,
-		roOff: false, burstUntil: 0, burstOpaque: false
+		roOff: false, trust: false, autonomyOff: false, burstUntil: 0, burstOpaque: false
 	});
 	let autoAllowBusy = $state(false);
 	let autoAllowOpen = $state(false);
@@ -252,13 +253,15 @@
 	let nowSec = $state(Math.floor(Date.now() / 1000));
 	// Reads are on unless this project was opted out (.ro-off) — or, legacy, explicitly on.
 	const readsOn = $derived(autoAllow.enabled || !autoAllow.roOff);
+	// ADR-028 E: autonomy+install on unless opted out (.autonomy-off) — or legacy .autonomy.
+	const autonomyOn = $derived(autoAllow.autonomy || !autoAllow.autonomyOff);
 	// ADR-028 B: a time-boxed autonomy burst is active until its epoch passes.
 	const burstActive = $derived(autoAllow.burstUntil > nowSec);
 	const burstRemainMin = $derived(burstActive ? Math.ceil((autoAllow.burstUntil - nowSec) / 60) : 0);
-	// Shield is "active" (filled) when reads are on, autonomy, or a burst; autonomy/burst
-	// tint it amber as a louder "you've widened beyond read-only" signal.
-	const aaActive = $derived(readsOn || autoAllow.autonomy || burstActive);
-	const aaWarn = $derived(autoAllow.autonomy || burstActive);
+	// Shield is "active" (filled) when reads are on, autonomy, trust, or a burst;
+	// autonomy/trust/burst tint it amber as a louder "widened beyond read-only" signal.
+	const aaActive = $derived(readsOn || autonomyOn || autoAllow.trust || burstActive);
+	const aaWarn = $derived(autonomyOn || autoAllow.trust || burstActive);
 	// Tick the countdown while a burst is set (15s granularity for a minutes display).
 	$effect(() => {
 		if (!autoAllow.burstUntil) return;
@@ -1682,10 +1685,10 @@
 {#snippet aaSub(title: string, desc: string, on: boolean, toggle: () => void)}
 	<button
 		type="button"
-		disabled={autoAllowBusy || !autoAllow.autonomy}
+		disabled={autoAllowBusy || !autonomyOn}
 		onclick={toggle}
 		aria-pressed={on}
-		class="w-full flex items-start gap-2.5 p-2 pl-3 rounded-lg hover:bg-[var(--color-bg)]/60 text-left transition disabled:cursor-not-allowed {autoAllow.autonomy
+		class="w-full flex items-start gap-2.5 p-2 pl-3 rounded-lg hover:bg-[var(--color-bg)]/60 text-left transition disabled:cursor-not-allowed {autonomyOn
 			? ''
 			: 'opacity-40'}"
 	>
@@ -1767,24 +1770,31 @@
 					() => setAutoAllow(readsOn ? { roOff: true, enabled: false } : { roOff: false })
 				)}
 				{@render aaRow(
-					'Tự chủ (build/test + git add/commit)',
-					'⚠ build/test THỰC THI mã của project. Là tuyên bố tin cậy, không phải “an toàn”.',
-					autoAllow.autonomy,
+					'Tự chủ (mặc định BẬT trong workspace)',
+					'⚠ build/test/lint + git add/commit/stash + cài gói (npm/pnpm/dotnet/pip). Khôi phục được; floor + secret vẫn chặn. Là tuyên bố tin cậy, không phải “an toàn”. Tắt để buộc hỏi lại.',
+					autonomyOn,
 					true,
-					() => setAutoAllow({ autonomy: !autoAllow.autonomy })
+					// Off → opt out (.autonomy-off) AND clear any legacy .autonomy; On → drop the opt-out.
+					() =>
+						setAutoAllow(
+							autonomyOn
+								? { autonomyOff: true, autonomy: false }
+								: { autonomyOff: false }
+						)
+				)}
+				{@render aaRow(
+					'Full trust (opaque)',
+					'Thêm opaque trên nền Tự chủ: ssh body / heredoc / chương trình bất kỳ chạy không hỏi. Push vẫn hỏi. Một chạm / project — không hết hạn.',
+					autoAllow.trust,
+					true,
+					() => setAutoAllow({ trust: !autoAllow.trust })
 				)}
 				<div class="border-t border-[var(--color-border)]/60 my-1"></div>
 				{@render aaSub(
 					'Cho git push',
-					'Đẩy lên remote (không cho --force).',
+					'Đẩy lên remote (không cho --force). Riêng biệt — hướng ra ngoài.',
 					autoAllow.push,
 					() => setAutoAllow({ push: !autoAllow.push })
-				)}
-				{@render aaSub(
-					'Cho cài gói',
-					'npm/pnpm install, dotnet restore (chạy script + tải mạng).',
-					autoAllow.install,
-					() => setAutoAllow({ install: !autoAllow.install })
 				)}
 				<div class="border-t border-[var(--color-border)]/60 my-1"></div>
 				{#if burstActive}
